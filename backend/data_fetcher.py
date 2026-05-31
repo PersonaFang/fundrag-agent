@@ -104,17 +104,23 @@ def get_fund_basic_info(fund_code: str) -> Dict:
 
     try:
         # akshare 获取基金基本信息
+        # 返回的是 DataFrame，列为 ['item', 'value']，需先转为 dict
         # 🌰 就像去「基金公司官网」查基本资料
-        fund_info = ak.fund_individual_basic_info_xq(symbol=fund_code)
+        fund_info_df = ak.fund_individual_basic_info_xq(symbol=fund_code)
+        fund_info = dict(zip(fund_info_df["item"], fund_info_df["value"]))
+
+        # 基金类型原始值可能含 "-"（如「股票型-普通股票」），取 "-" 前半段
+        raw_type = str(fund_info.get("基金类型", "混合型"))
+        clean_type = raw_type.split("-")[0].strip()
 
         result = {
             "fund_code": fund_code,
-            "name": fund_info.get("基金全称", f"基金{fund_code}"),
-            "type": fund_info.get("基金类型", "混合型"),
-            "size": fund_info.get("基金规模", "未知"),
-            "manager": fund_info.get("基金经理", "未知"),
-            "establish_date": fund_info.get("成立时间", "未知"),
-            "company": fund_info.get("基金公司", "未知"),
+            "name": str(fund_info.get("基金全称", fund_info.get("基金名称", f"基金{fund_code}"))),
+            "type": clean_type,
+            "size": str(fund_info.get("基金规模", fund_info.get("最新规模", "未知"))),
+            "manager": str(fund_info.get("基金经理", "未知")),
+            "establish_date": str(fund_info.get("成立时间", "未知")),
+            "company": str(fund_info.get("基金公司", "未知")),
             "data_source": "akshare"
         }
 
@@ -217,21 +223,16 @@ def get_fund_manager_info(manager_name: str) -> Dict:
 
     try:
         # 搜索基金经理信息
+        # akshare 1.18.x 实际列名：['序号','姓名','所属公司','现任基金代码',
+        #   '现任基金','累计从业时间','现任基金资产总规模','现任基金最佳回报']
         manager_df = ak.fund_manager_em()
 
-        # akshare 1.18.x 列名有变动，动态查找「经理姓名」列
-        # 🌰 类比：不同版本的花名册格式不同，先找到「姓名」那一列
+        # 确定姓名列：优先用"姓名"，兼容旧版"基金经理"
         name_col = None
-        for col in manager_df.columns:
-            if "经理" in col and ("人" in col or col == "基金经理"):
-                name_col = col
+        for candidate in ["姓名", "基金经理", "name"]:
+            if candidate in manager_df.columns:
+                name_col = candidate
                 break
-        if name_col is None:
-            # 兜底：找第一个包含「经理」的列
-            for col in manager_df.columns:
-                if "经理" in col:
-                    name_col = col
-                    break
         if name_col is None:
             print(f"⚠️  fund_manager_em 列名未识别，可用列：{list(manager_df.columns)}")
             return _mock_manager_info(manager_name)
@@ -241,20 +242,21 @@ def get_fund_manager_info(manager_name: str) -> Dict:
 
         if not manager_data.empty:
             row = manager_data.iloc[0]
-            # 动态查找各字段（列名在不同版本下可能不同）
-            def find_col(keywords):
-                for k in keywords:
-                    for c in manager_df.columns:
-                        if k in c:
-                            return str(row.get(c, "未知"))
-                return "未知"
+
+            # 累计从业时间单位是「天」，转换为年
+            days_raw = row.get("累计从业时间", 0)
+            try:
+                experience_years = round(int(str(days_raw).replace("天", "").strip()) / 365, 1)
+                experience_str = f"{experience_years}年"
+            except Exception:
+                experience_str = str(days_raw)
 
             result = {
                 "name": manager_name,
-                "experience_years": find_col(["年限", "年份"]),
-                "managed_funds": find_col(["数量", "只数", "基金数"]),
-                "total_aum": find_col(["规模", "资产"]),
-                "best_return": find_col(["回报", "收益", "业绩"]),
+                "experience_years": experience_str,
+                "managed_funds": str(row.get("现任基金", "未知")),
+                "total_aum": str(row.get("现任基金资产总规模", "未知")),
+                "best_return": str(row.get("现任基金最佳回报", "未知")),
                 "data_source": "akshare"
             }
             _save_cache(cache_path, result)
@@ -323,8 +325,15 @@ def get_fund_ranking(fund_code: str, fund_type: str) -> Dict:
                     break
 
             if code_col and fund_code in rank_df[code_col].values:
-                idx = rank_df[rank_df[code_col] == fund_code].index[0]
-                rank_position = int(idx) + 1
+                matched_row = rank_df[rank_df[code_col] == fund_code].iloc[0]
+                # 优先使用「序号」列（akshare 返回的真实排名序号）
+                if "序号" in rank_df.columns:
+                    rank_position = int(matched_row["序号"])
+                else:
+                    # 兜底：用 DataFrame 中的行位置
+                    rank_position = rank_df[rank_df[code_col] == fund_code].index.get_loc(
+                        rank_df[rank_df[code_col] == fund_code].index[0]
+                    ) + 1
                 percentile = round(rank_position / total_funds * 100, 1)
                 result = {
                     "fund_code": fund_code,

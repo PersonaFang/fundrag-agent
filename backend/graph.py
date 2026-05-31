@@ -74,6 +74,7 @@ class FundAnalysisState(TypedDict):
     sentiment_analysis: str      # 舆情研究员的分析结果
     risk_analysis: str           # 风险控制官的分析结果
     final_report: str            # 最终综合报告
+    data_quality: str            # 数据质量摘要（验证节点填入，供报告节点引用）
     error_messages: List[str]    # 错误信息收集（不中断流程，只记录）
     current_step: str            # 当前执行步骤（供前端显示进度）
 
@@ -326,6 +327,52 @@ def create_fund_analysis_graph():
                 "current_step": "风险评估失败 ❌",
             }
 
+    def validate_data_quality(state: FundAnalysisState) -> dict:
+        """
+        节点3.5：数据质量验证（行情分析后、舆情分析前插入）
+        检查哪些数据是真实 akshare 数据，哪些是 mock 数据，
+        生成 data_quality 摘要供后续报告节点引用。
+        🌰 类比：「质检员」在流水线上检查食材来源，贴上「真实/模拟」标签
+        """
+        print(f"\n{'='*50}")
+        print(f"🔍 [验证节点] 数据质量检查...")
+
+        market = state.get("market_analysis", "")
+
+        has_real_data = "akshare实时数据" in market or (
+            "akshare" in market and "mock" not in market.lower() and "模拟" not in market
+        )
+        has_mock_data = (
+            "mock" in market.lower()
+            or "模拟数据" in market
+            or "数据获取失败" in market
+        )
+
+        issues = []
+        if "业绩获取失败" in market or "模拟数据" in market:
+            issues.append("业绩数据含模拟值")
+        if "经理" in market and ("未知" in market or "模拟" in market):
+            issues.append("基金经理信息不完整")
+        if "排名" in market and "模拟" in market:
+            issues.append("同类排名为估算值")
+
+        if not issues:
+            completeness = "完整（akshare实时数据）"
+            quality_notice = "✅ 本报告所有量化数据均来自 akshare 实时接口，数据可信。"
+        else:
+            completeness = f"部分缺失（含模拟数据：{', '.join(issues)}）"
+            quality_notice = (
+                f"⚠️ 以下数据项使用了估算/模拟值（※标注处仅供参考）：\n"
+                + "\n".join(f"- {i}" for i in issues)
+                + "\n\n建议：如需精确数据，请稍后重试或直接查询基金公司官网。"
+            )
+
+        print(f"   数据完整性：{completeness}")
+        return {
+            "data_quality": quality_notice,
+            "current_step": "数据质量验证完成 ✅",
+        }
+
     def run_report_generation(state: FundAnalysisState) -> dict:
         """
         节点4：汇总生成最终报告
@@ -333,6 +380,8 @@ def create_fund_analysis_graph():
         """
         print(f"\n{'='*50}")
         print(f"📝 [节点4] 报告撰写员开始汇总...")
+
+        data_quality_notice = state.get("data_quality", "数据质量未检测")
 
         synthesis_query = (
             f"请综合以下三份分析报告，生成最终的基金投研报告：\n\n"
@@ -345,7 +394,10 @@ def create_fund_analysis_graph():
             f"{'='*40}\n"
             f"基金代码：{state['fund_code']}\n"
             f"用户原始问题：{state['user_query']}\n\n"
-            f"请严格按照规定的 Markdown 格式输出完整的投研报告。"
+            f"⚠️ 数据质量说明（必须如实填入报告「七、数据质量说明」章节）：\n"
+            f"{data_quality_notice}\n\n"
+            f"请严格按照规定的 Markdown 格式输出完整的投研报告，"
+            f"将上方数据质量说明填入「{{data_quality_notice}}」占位符处。"
         )
 
         try:
@@ -384,6 +436,7 @@ def create_fund_analysis_graph():
 
     # 添加节点
     workflow.add_node("market_analysis", run_market_analysis)
+    workflow.add_node("validate_data", validate_data_quality)   # 新增：数据质量验证
     workflow.add_node("sentiment_analysis", run_sentiment_analysis)
     workflow.add_node("risk_analysis", run_risk_analysis)
     workflow.add_node("report_generation", run_report_generation)
@@ -392,8 +445,9 @@ def create_fund_analysis_graph():
     workflow.set_entry_point("market_analysis")
 
     # 定义执行顺序（流水线）
-    # 🌰 行情 → 舆情 → 风控 → 报告
-    workflow.add_edge("market_analysis", "sentiment_analysis")
+    # 🌰 行情 → 数据验证 → 舆情 → 风控 → 报告
+    workflow.add_edge("market_analysis", "validate_data")        # 验证节点插入行情之后
+    workflow.add_edge("validate_data", "sentiment_analysis")
     workflow.add_edge("sentiment_analysis", "risk_analysis")
     workflow.add_edge("risk_analysis", "report_generation")
     workflow.add_edge("report_generation", END)
@@ -402,8 +456,8 @@ def create_fund_analysis_graph():
     app = workflow.compile()
 
     print("✅ FundRAG Multi-Agent 图构建完成")
-    print("   节点数量：4 个")
-    print("   执行顺序：行情分析 → 舆情分析 → 风险评估 → 报告生成")
+    print("   节点数量：5 个")
+    print("   执行顺序：行情分析 → 数据验证 → 舆情分析 → 风险评估 → 报告生成")
 
     return app
 
@@ -435,6 +489,7 @@ def run_fund_analysis(fund_code: str, user_query: str, session_id: str = "defaul
         "sentiment_analysis": "",
         "risk_analysis": "",
         "final_report": "",
+        "data_quality": "",
         "error_messages": [],
         "current_step": "开始分析...",
     }

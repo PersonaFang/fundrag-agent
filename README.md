@@ -3,7 +3,7 @@
 > 基于 LangGraph + Multi-Agent 架构的 A 股公募基金智能分析系统
 
 [![Python](https://img.shields.io/badge/Python-3.11+-blue)](https://python.org)
-[![LangGraph](https://img.shields.io/badge/LangGraph-0.4.x-green)](https://github.com/langchain-ai/langgraph)
+[![LangGraph](https://img.shields.io/badge/LangGraph-1.2.x-green)](https://github.com/langchain-ai/langgraph)
 [![Streamlit](https://img.shields.io/badge/Streamlit-1.45-red)](https://streamlit.io)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
 
@@ -15,50 +15,54 @@
 用户输入基金代码
         │
         ▼
-┌───────────────────────────────────────────────┐
-│           LangGraph Orchestrator              │
-│         （状态机 · 总指挥 · 流水线）           │
-└──────┬──────────┬──────────┬──────────────────┘
-       │          │          │
-       ▼          ▼          ▼
-  ┌─────────┐ ┌─────────┐ ┌─────────┐
-  │📊 行情  │ │📰 舆情  │ │⚠️ 风控  │  ← 三个专职 Sub-Agent
-  │分析师   │ │研究员   │ │官       │     顺序执行
-  │         │ │         │ │         │
-  │akshare  │ │Tavily   │ │风险模型 │  ← 各用专属工具
-  └────┬────┘ └────┬────┘ └────┬────┘
-       │           │           │
-       └─────┬─────┘           │
-             └────────┬────────┘
-                      ▼
-              ┌───────────────┐
-              │  📝 报告撰写员 │  ← 汇总三份分析
-              │  GPT-4o-mini  │
-              └───────┬───────┘
-                      ▼
-              ┌───────────────┐
-              │  综合投研报告  │  → Streamlit 展示 / Markdown 导出
-              └───────────────┘
+┌──────────────────┐
+│  📊 行情分析师   │  akshare 实时数据
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  🔍 数据质量验证  │  检查真实/模拟数据，生成质量摘要
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  📰 舆情研究员   │  Tavily 实时新闻
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────┐
+│  ⚠️ 风险控制官   │  内置风险评分模型
+└────────┬─────────┘
+         │
+         ▼
+┌──────────────────────────────────┐
+│  📝 报告撰写员（DeepSeek v4-pro）│  含数据质量说明章节
+└────────┬─────────────────────────┘
+         ▼
+   综合投研报告  →  Streamlit 展示 / Markdown 导出
 ```
 
 ### 核心组件
 
-| 组件 | 职责 | 使用工具 |
-|------|------|----------|
-| 📊 行情分析师 | 量化数据分析（净值/回撤/排名/经理） | akshare 数据接口 |
-| 📰 舆情研究员 | 新闻情绪分析（基金/行业/政策） | Tavily 实时搜索 |
-| ⚠️ 风险控制官 | 风险量化评估（评分/等级/维度） | 内置风险模型 |
-| 📝 报告撰写员 | 综合研判总结 | GPT-4o-mini |
+| 组件 | 职责 | 使用工具 / 模型 |
+|------|------|----------------|
+| 📊 行情分析师 | 量化数据分析（净值/回撤/排名/经理） | akshare 数据接口 · DeepSeek v4-flash |
+| 🔍 数据质量验证 | 检测真实 vs 模拟数据，生成质量摘要 | 无外部调用（纯逻辑） |
+| 📰 舆情研究员 | 新闻情绪分析（基金/行业/政策） | Tavily 实时搜索 · DeepSeek v4-flash |
+| ⚠️ 风险控制官 | 风险量化评估（评分/等级/维度） | 内置风险模型 · DeepSeek v4-flash |
+| 📝 报告撰写员 | 综合研判总结（含数据质量章节） | DeepSeek v4-pro（思考模式开启） |
 
 ---
 
 ## ✨ 技术亮点
 
-1. **Multi-Agent 协作**：4 个专职 Agent 各司其职，LangGraph 状态机统一调度，比单 Agent 分析质量更高
-2. **真实金融数据**：集成 akshare（A 股数据）+ Tavily（实时新闻），非玩具项目
-3. **容错设计**：任一 Agent 失败不中断流程，自动降级至模拟数据，错误统一收集
-4. **缓存优化**：基金数据本地 JSON 缓存（基本信息 24h / 业绩数据 1h），减少重复 API 调用
-5. **完整产品**：Streamlit 前端 + 实时进度 + Tab 分组 + 历史记录 + Markdown 导出
+1. **Multi-Agent 协作**：5 节点流水线（行情→数据验证→舆情→风控→报告），LangGraph 1.2 状态机统一调度
+2. **真实金融数据**：集成 akshare 1.18.x（A 股数据）+ Tavily（实时新闻），接口参数已与最新版对齐
+3. **数据质量可见**：`validate_data` 节点检测真实/模拟数据，最终报告包含「数据质量说明」章节，不混淆真假数据
+4. **容错设计**：任一 Agent 失败不中断流程，自动降级至模拟数据并明确标注，错误统一收集
+5. **DeepSeek 双模型**：工具调用 Agent 用 v4-flash（快速），报告撰写 Agent 用 v4-pro + 思考模式（深度推理）
+6. **缓存优化**：基金数据本地 JSON 缓存（基本信息 24h / 业绩数据 1h），减少重复 API 调用
+7. **完整产品**：Streamlit 前端 + 实时进度 + Tab 分组 + 历史记录 + Markdown 导出
 
 ---
 
@@ -102,7 +106,7 @@ streamlit run frontend/app.py
 
 | API | 申请地址 | 用途 | 费用 |
 |-----|----------|------|------|
-| OpenAI API Key | https://platform.openai.com | GPT-4o-mini 驱动 Agent | 按量计费，每次分析约 $0.03-0.08 |
+| DeepSeek API Key | https://platform.deepseek.com | v4-flash（工具调用）+ v4-pro（报告生成） | 按量计费，每次分析约 ¥0.1-0.3 |
 | Tavily API Key | https://tavily.com | 实时新闻搜索 | 每月 1000 次免费 |
 | akshare | 无需申请 | A 股 / 基金数据 | 完全免费 |
 
