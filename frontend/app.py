@@ -51,7 +51,7 @@ st.set_page_config(
     page_title="FundRAG - 基金智能投研助手",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # ============ 自定义 CSS 样式 ============
@@ -368,7 +368,7 @@ def main():
 | 📊 行情分析师 | 量化数据分析（净值/回撤/排名） | akshare 金融数据接口 |
 | 📰 舆情研究员 | 新闻情绪分析（基金/行业/政策） | Tavily 实时搜索引擎 |
 | ⚠️ 风险控制官 | 风险量化评估（评分/等级/维度） | 内置风险评分模型 |
-| 📝 报告撰写员 | 综合研判，生成完整投研报告 | GPT-4o-mini |
+| 📝 报告撰写员 | 综合研判，生成完整投研报告 | DeepSeek v4-pro |
 
 ### 🔄 工作流程
 
@@ -377,11 +377,13 @@ def main():
     ↓
 📊 行情分析（akshare数据）
     ↓
+🔍 数据质量验证
+    ↓
 📰 舆情分析（Tavily新闻）
     ↓
 ⚠️ 风险评估（量化模型）
     ↓
-📝 综合报告（GPT整合）
+📝 综合报告（DeepSeek v4-pro）
     ↓
 完整投研报告
 ```

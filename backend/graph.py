@@ -149,6 +149,7 @@ def create_fund_analysis_graph():
         enable_thinking=True,
     )
     today = _get_today()
+    year  = today[:4]   # 例："2026"，供 SENTIMENT prompt 搜索年份使用
 
     # ---- 创建四个专职 Sub-Agent ----
 
@@ -171,7 +172,7 @@ def create_fund_analysis_graph():
     sentiment_agent = create_react_agent(
         model=llm_fast,
         tools=[tool_search_fund_news],
-        prompt=SENTIMENT_ANALYST_PROMPT.format(today=today),
+        prompt=SENTIMENT_ANALYST_PROMPT.format(today=today, year=year),
     )
 
     # Sub-Agent 3：风险控制官
