@@ -494,3 +494,205 @@ def _mock_fund_ranking(fund_code: str) -> Dict:
         "rank_description": "同类基金中表现良好" if percentile <= 30 else "同类基金中表现中等",
         "data_source": "mock"
     }
+
+
+# ============================================================
+# V2.0 新增：构建 FundSnapshot 的统一入口
+# ============================================================
+
+def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
+    """
+    拉取所有数据并构建 FundSnapshot 对象
+    这是 V2.0 graph 的唯一数据入口
+
+    🌰 类比：「采购员」把所有食材买齐、整理好放进冰箱，
+             后续所有厨师从同一个冰箱取材
+    """
+    from datetime import date as date_type
+    from backend.schemas import (
+        FundSnapshot, MetricSource, ManagerInfo, PeerRank
+    )
+
+    if report_date is None:
+        report_date = date_type.today()
+
+    # 1. 基本信息
+    basic = get_fund_basic_info(code)
+    is_mock_basic = basic.get("data_source", "mock") == "mock"
+
+    # 解析成立日期
+    inception_date = None
+    establish_str = basic.get("establish_date", "")
+    if establish_str and establish_str != "未知":
+        try:
+            from datetime import datetime as dt_type
+            # 支持多种日期格式
+            for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y/%m/%d"):
+                try:
+                    inception_date = dt_type.strptime(establish_str, fmt).date()
+                    break
+                except ValueError:
+                    continue
+        except Exception:
+            pass
+
+    # 解析基金规模
+    size_str = basic.get("size", "")
+    fund_size_val = None
+    try:
+        size_num_str = re.sub(r'[^\d.]', '', str(size_str))
+        if size_num_str:
+            fund_size_val = float(size_num_str)
+    except (ValueError, TypeError):
+        pass
+
+    # 2. 业绩数据
+    perf = get_fund_performance(code, years=3)
+    is_mock_perf = perf.get("data_source", "mock") == "mock"
+
+    # 解析净值
+    nav_val = perf.get("latest_nav")
+    first_nav_val = perf.get("first_nav")
+    total_return = perf.get("total_return_pct")
+    max_drawdown = perf.get("max_drawdown_pct")
+    actual_days = perf.get("actual_days", 0)
+    last_date_str = perf.get("last_date")
+
+    last_nav_date = None
+    if last_date_str:
+        try:
+            from datetime import datetime as dt_type
+            last_nav_date = dt_type.strptime(last_date_str, "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            pass
+
+    # 3. 基金经理
+    manager_name = basic.get("manager", "")
+    managers: list[ManagerInfo] = []
+    if manager_name and manager_name != "未知":
+        mgr_data = get_fund_manager_info(manager_name)
+        is_mock_mgr = mgr_data.get("data_source", "mock") == "mock"
+
+        if mgr_data.get("is_multi_manager"):
+            for m in mgr_data.get("managers", []):
+                exp_raw = m.get("experience_years", "0年")
+                try:
+                    exp_years = float(str(exp_raw).replace("年", "").strip())
+                except (ValueError, TypeError):
+                    exp_years = None
+                aum_raw = m.get("total_aum", "")
+                try:
+                    aum_bn = float(re.sub(r'[^\d.]', '', str(aum_raw))) if aum_raw else None
+                except (ValueError, TypeError):
+                    aum_bn = None
+                managers.append(ManagerInfo(
+                    name=m.get("name", "未知"),
+                    experience_years=exp_years,
+                    is_mock=is_mock_mgr,
+                    total_aum_bn=aum_bn,
+                ))
+        else:
+            exp_raw = mgr_data.get("experience_years", "0年")
+            try:
+                exp_years = float(str(exp_raw).replace("年", "").strip())
+            except (ValueError, TypeError):
+                exp_years = None
+            aum_raw = mgr_data.get("total_aum", "")
+            try:
+                aum_bn = float(re.sub(r'[^\d.]', '', str(aum_raw))) if aum_raw else None
+            except (ValueError, TypeError):
+                aum_bn = None
+            managers.append(ManagerInfo(
+                name=mgr_data.get("name", manager_name),
+                experience_years=exp_years,
+                is_mock=is_mock_mgr,
+                total_aum_bn=aum_bn,
+            ))
+
+    # 4. 同类排名
+    fund_type = basic.get("type", "混合型")
+    ranking = get_fund_ranking(code, fund_type)
+    is_mock_rank = ranking.get("data_source", "mock") == "mock"
+    peer_rank = None
+    rank_pos = ranking.get("rank_position")
+    total_funds = ranking.get("total_funds_in_category")
+    if rank_pos and total_funds:
+        peer_rank = PeerRank(
+            rank=int(rank_pos),
+            total=int(total_funds),
+            percentile=round(int(rank_pos) / int(total_funds) * 100, 2),
+        )
+
+    # 5. 基准对比（P3）
+    benchmark_return_metric = None
+    alpha_metric = None
+    benchmark_name = None
+    if inception_date:
+        try:
+            from backend.benchmark import get_benchmark_return
+            benchmark_return_metric, benchmark_name = get_benchmark_return(
+                fund_type=fund_type,
+                inception_date=inception_date,
+                report_date=report_date,
+                fund_code=code,
+            )
+            if (benchmark_return_metric is not None
+                    and benchmark_return_metric.value is not None
+                    and total_return is not None):
+                alpha_val = round(float(total_return) - float(benchmark_return_metric.value), 2)
+                alpha_metric = MetricSource(
+                    value=alpha_val,
+                    unit="%",
+                    source="calculated",
+                    is_mock=benchmark_return_metric.is_mock,
+                    note=f"超额收益 = 基金收益({total_return}%) - 基准收益({benchmark_return_metric.value}%)",
+                )
+        except Exception as e:
+            print(f"⚠️ 基准数据计算失败（不影响主流程）：{e}")
+
+    # 6. 构建 FundSnapshot
+    snapshot = FundSnapshot(
+        code=code,
+        report_date=report_date,
+        name=basic.get("name"),
+        fund_type=fund_type,
+        fund_company=basic.get("company"),
+        inception_date=inception_date,
+        nav=MetricSource(
+            value=nav_val, unit="元", source="akshare" if not is_mock_perf else "mock",
+            as_of=last_nav_date, is_mock=is_mock_perf,
+            endpoint="fund_open_fund_info_em"
+        ) if nav_val is not None else None,
+        accumulated_nav=MetricSource(
+            value=first_nav_val, unit="元", source="akshare" if not is_mock_perf else "mock",
+            as_of=last_nav_date, is_mock=is_mock_perf,
+        ) if first_nav_val is not None else None,
+        fund_size_bn=MetricSource(
+            value=fund_size_val, unit="亿元",
+            source="akshare" if not is_mock_basic else "mock",
+            is_mock=is_mock_basic,
+        ) if fund_size_val is not None else None,
+        return_since_inception=MetricSource(
+            value=total_return, unit="%",
+            source="akshare" if not is_mock_perf else "mock",
+            as_of=last_nav_date, is_mock=is_mock_perf,
+            note=perf.get("actual_period_label", ""),
+        ) if total_return is not None else None,
+        max_drawdown=MetricSource(
+            value=abs(max_drawdown) if max_drawdown is not None else None, unit="%",
+            source="akshare" if not is_mock_perf else "mock",
+            as_of=last_nav_date, is_mock=is_mock_perf,
+        ) if max_drawdown is not None else None,
+        peer_rank=peer_rank,
+        managers=managers,
+        benchmark_name=benchmark_name,
+        benchmark_return_pct=benchmark_return_metric,
+        alpha_pct=alpha_metric,
+        raw={
+            "basic": basic,
+            "perf": {k: v for k, v in perf.items() if k != "nav_history"},
+            "ranking": ranking,
+        }
+    )
+
+    return snapshot

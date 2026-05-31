@@ -124,6 +124,86 @@ def render_agent_status_table(statuses: dict) -> None:
 """)
 
 
+def render_data_quality_badge(result: dict) -> None:
+    """
+    V2.0：根据数据质量等级显示彩色 Badge
+    """
+    quality_json = result.get("data_quality_json", "")
+    if not quality_json:
+        return
+
+    try:
+        from backend.schemas import DataQualityReport
+        quality = DataQualityReport.model_validate_json(quality_json)
+        badge_config = {
+            "real":    ("🟢 数据真实", "success"),
+            "partial": ("🟡 部分模拟", "warning"),
+            "mock":    ("🔴 全部模拟", "error"),
+            "failed":  ("🔴 数据矛盾", "error"),
+        }
+        label, badge_type = badge_config.get(quality.level.value, ("⚪ 未知", "info"))
+
+        if badge_type == "success":
+            st.success(label)
+        elif badge_type == "warning":
+            st.warning(label)
+        else:
+            st.error(label)
+
+        if quality.contradictions:
+            st.error("⛔ 检测到数据矛盾，本次分析不输出正式评级")
+            for c in quality.contradictions:
+                st.caption(f"  - {c}")
+
+        if quality.mock_metric_count > 0:
+            st.warning(f"⚠️ 含 {quality.mock_metric_count} 项模拟数据，适配结论为「信息不足」")
+
+    except Exception:
+        pass
+
+
+def render_raw_metrics_expander(result: dict) -> None:
+    """
+    V2.0：原始指标溯源展开区
+    """
+    snapshot_json = result.get("snapshot_json", "")
+    if not snapshot_json:
+        return
+
+    try:
+        from backend.schemas import FundSnapshot
+        import pandas as pd
+        snapshot = FundSnapshot.model_validate_json(snapshot_json)
+        with st.expander("🔬 原始指标溯源（点击展开）"):
+            st.caption("每项指标均注明来源、截止日期、是否模拟")
+            metric_fields = [
+                ("最新净值",       snapshot.nav),
+                ("基金规模(亿元)", snapshot.fund_size_bn),
+                ("自成立收益",     snapshot.return_since_inception),
+                ("近1年收益",      snapshot.return_1y),
+                ("近3年收益",      snapshot.return_3y),
+                ("最大回撤",       snapshot.max_drawdown),
+                ("基准收益",       snapshot.benchmark_return_pct),
+                ("超额收益Alpha",  snapshot.alpha_pct),
+            ]
+            rows = []
+            for label, metric in metric_fields:
+                if metric is None:
+                    rows.append({"指标": label, "数值": "缺失", "性质": "—",
+                                 "截止日期": "—", "来源": "—"})
+                else:
+                    rows.append({
+                        "指标":     label,
+                        "数值":     f"{metric.value}{metric.unit or ''}",
+                        "性质":     "🔴模拟" if metric.is_mock else "✅真实",
+                        "截止日期": str(metric.as_of) if metric.as_of else "未知",
+                        "来源":     metric.source,
+                    })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+    except Exception as e:
+        st.caption(f"指标溯源加载失败：{e}")
+
+
 def main():
 
     # ---- 标题区 ----
@@ -248,14 +328,16 @@ def main():
 
                     progress_bar.progress(100, text="✅ 分析完成！")
 
-                    # 更新所有 Agent 状态
-                    final_step = result.get("current_step", "")
-                    error_count = len(result.get("error_messages", []))
+                    # 更新所有 Agent 状态（兼容 V1/V2 字段名）
+                    error_count = len(result.get("errors", result.get("error_messages", [])))
+                    market_ok   = result.get("market_commentary") or result.get("market_analysis")
+                    sentiment_ok = result.get("sentiment_commentary") or result.get("sentiment_analysis")
+                    risk_ok     = result.get("risk_commentary") or result.get("risk_analysis")
                     st.session_state.agent_statuses = {
-                        "market": "✅ 完成" if result.get("market_analysis") else "❌ 失败",
-                        "sentiment": "✅ 完成" if result.get("sentiment_analysis") else "❌ 失败",
-                        "risk": "✅ 完成" if result.get("risk_analysis") else "❌ 失败",
-                        "report": "✅ 完成" if result.get("final_report") else "❌ 失败",
+                        "market":    "✅ 完成" if market_ok else "❌ 失败",
+                        "sentiment": "✅ 完成" if sentiment_ok else "❌ 失败",
+                        "risk":      "✅ 完成" if risk_ok else "❌ 失败",
+                        "report":    "✅ 完成" if result.get("final_report") else "❌ 失败",
                     }
 
                     st.session_state.analysis_result = result
@@ -314,7 +396,10 @@ def main():
             ])
 
             with tab_final:
-                # 次新基金额外提示
+                # V2.0：数据质量 Badge
+                render_data_quality_badge(result)
+
+                # 次新基金额外提示（兼容旧版字段）
                 if result.get("is_new_fund"):
                     st.warning(
                         f"⚠️ **次新基金提示**：该基金运行仅 {result.get('actual_days', 0)} 天，"
@@ -323,8 +408,11 @@ def main():
                 final_report = result.get("final_report", "报告生成中...")
                 st.markdown(final_report)
 
+                # V2.0：原始指标溯源
+                render_raw_metrics_expander(result)
+
                 # 显示错误详情（如有）
-                errors = result.get("error_messages", [])
+                errors = result.get("error_messages", result.get("errors", []))
                 if errors:
                     with st.expander(f"⚠️ {len(errors)} 个子任务遇到问题（点击查看详情）"):
                         for err in errors:
@@ -359,33 +447,44 @@ def main():
             st.info("👈 在左侧输入基金代码，点击「开始 Multi-Agent 分析」")
 
             st.markdown("""
-### 🤖 系统架构
+### 🤖 V2.0 系统架构
 
-本系统采用 **LangGraph Multi-Agent 协作架构**，由 4 个专职 AI 组成：
+本系统采用 **LangGraph Multi-Agent V2.0 协作架构**：
+> 核心原则：**数据、评分、评级由代码决定；LLM只负责解释**
 
-| Agent | 职责 | 使用工具 |
-|:------|:-----|:---------|
-| 📊 行情分析师 | 量化数据分析（净值/回撤/排名） | akshare 金融数据接口 |
-| 📰 舆情研究员 | 新闻情绪分析（基金/行业/政策） | Tavily 实时搜索引擎 |
-| ⚠️ 风险控制官 | 风险量化评估（评分/等级/维度） | 内置风险评分模型 |
-| 📝 报告撰写员 | 综合研判，生成完整投研报告 | DeepSeek v4-pro |
+| 节点 | 职责 | 技术 |
+|:-----|:-----|:-----|
+| 📡 数据拉取 | 构建 FundSnapshot（含 is_mock 标记） | akshare 实时接口 |
+| 🔍 质量校验 | 检测矛盾/缺失/模拟，写入 run_days | 确定性逻辑 |
+| 📊 确定性评分 | 代码计算所有分数，LLM 不可修改 | Python 评分模型 |
+| 📊 行情解释 | 解释 snapshot_json，禁止编造数字 | DeepSeek v4-flash |
+| 📰 舆情分析 | 多空平衡搜索 + SENTIMENT_SCORE | Tavily + DeepSeek |
+| ⚠️ 风险解释 | 解释 score_json，不重新计算 | DeepSeek v4-flash |
+| 📝 模板渲染 | 代码填表格，LLM 只填解释段落 | report_renderer.py |
+| 🛡️ 质量守卫 | 拦截禁用词/重复章节/违规建议 | output_guard.py |
 
-### 🔄 工作流程
+### 🔄 V2.0 工作流程
 
 ```
 输入基金代码
     ↓
-📊 行情分析（akshare数据）
+📡 数据拉取（FundSnapshot + is_mock 标记）
     ↓
-🔍 数据质量验证
+🔍 数据质量校验（矛盾检测 → 拦截 or 继续）
     ↓
-📰 舆情分析（Tavily新闻）
+📊 确定性评分（代码裁判，不依赖 LLM）
     ↓
-⚠️ 风险评估（量化模型）
+📊 行情解释（LLM 解释数据）
     ↓
-📝 综合报告（DeepSeek v4-pro）
+📰 舆情分析（多空平衡 + SENTIMENT_SCORE）
     ↓
-完整投研报告
+⚠️ 风险解释（LLM 解释评分）
+    ↓
+📝 模板渲染（代码填数字，LLM 填解释）
+    ↓
+🛡️ 质量守卫（禁用词/章节/占位符）
+    ↓
+完整投研报告（含指标溯源）
 ```
 
 > ⚠️ **免责声明**：本系统仅供学习演示，不构成任何投资建议。基金有风险，投资需谨慎。过往业绩不代表未来表现。

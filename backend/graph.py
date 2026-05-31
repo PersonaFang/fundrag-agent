@@ -1,49 +1,45 @@
 # backend/graph.py
 """
-LangGraph Multi-Agent 状态机（系统核心）
+LangGraph Multi-Agent V2.0 状态机
 
-🌰 整体类比：
-    就像一家「基金研究所」的工作流程：
+核心原则：数据、评分、评级由代码决定；LLM只负责解释。
 
-    老板（Orchestrator）收到分析任务
-        ↓ 顺序派出三个专家组
-    📊行情组 → 📰舆情组 → ⚠️风控组  顺序工作
-        ↓ 三组结果汇总
-    📝报告员 综合三份报告，输出最终结论
+改进：
+- P0：每次分析生成唯一 run_id，彻底消除跨基金状态污染
+- 9节点流水线：fetch_snapshot → validate_quality → [data_issue_report | scoring_node]
+                → market_agent → sentiment_agent → risk_agent → render_report → END
+- FundRAGState：新增 run_id、snapshot_json、data_quality_json、score_json
+- LLM Agent 只负责解释（commentary），不再生成数字/表格
+- 舆情 Agent 输出 SENTIMENT_SCORE，由 graph 层提取并更新总分
 
-补充决策：
-- LangGraph 0.4.x 的 create_react_agent 通过 state_modifier 参数注入 prompt
-- MemorySaver 用于多轮对话记忆（同一 session_id 可追问）
-- 顺序执行（非并行）原因：舆情分析需要行情分析提供的基金名称，保证信息传递准确
-- 每个节点失败时写入 error_messages 并继续，不中断整体流程
+🌰 类比：
+    代码 = 财务部（算数字）
+    LLM  = 分析师（写解释）
+    两者职责严格分离
 """
 
 import os
-import json
+import re
+import uuid
+import time
 from datetime import datetime
-from typing import TypedDict, List, Annotated
-from dotenv import load_dotenv
+from typing import TypedDict, List
 
+from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import create_react_agent
+from langgraph.checkpoint.memory import MemorySaver
 
 from backend.tools import (
-    tool_get_fund_info,
-    tool_get_fund_performance,
-    tool_get_manager_info,
-    tool_search_fund_news,
-    tool_calculate_risk_score,
-    tool_compare_fund_ranking,
+    tool_search_fund_news_balanced,
 )
 from backend.agents import (
     MARKET_ANALYST_PROMPT,
     SENTIMENT_ANALYST_PROMPT,
     RISK_ANALYST_PROMPT,
-    REPORT_WRITER_PROMPT,
 )
 
-# 兼容本地 .env 和 Streamlit Cloud Secrets
 load_dotenv()
 
 try:
@@ -55,35 +51,44 @@ except Exception:
     DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 
 
-# ============ 定义状态结构 ============
-class FundAnalysisState(TypedDict):
-    """
-    整个分析流程的「共享白板」
-    所有 Agent 都从这里读取信息，也把结果写回这里
+# ============================================================
+# V2.0 状态定义
+# ============================================================
+class FundRAGState(TypedDict, total=False):
+    # 输入
+    fund_code:      str
+    user_question:  str
+    run_id:         str          # ✅ 每次唯一，彻底隔离
 
-    🌰 类比：研究所里的「公告栏」
-         每个专家组把分析结果贴在上面
-         最后报告员综合公告栏上的所有内容
+    # 数据层（P1 新增，存序列化 JSON）
+    snapshot_json:     str       # FundSnapshot.model_dump_json()
+    data_quality_json: str       # DataQualityReport.model_dump_json()
+    score_json:        str       # ScoreBreakdown.model_dump_json()
 
-    补充决策：TypedDict 不支持默认值，所有字段必须在 initial_state 中赋值
-    """
-    fund_code: str               # 要分析的基金代码
-    fund_name: str               # 基金名称（行情分析完成后填入）
-    fund_type: str               # 基金类型（行情分析完成后填入）
-    user_query: str              # 用户的原始问题
-    actual_days: int             # 基金实际运行天数（行情节点提取后填入）
-    is_new_fund: bool            # 是否为次新基金（运行 < 365 天）
-    market_analysis: str         # 行情分析师的分析结果
-    sentiment_analysis: str      # 舆情研究员的分析结果
-    risk_analysis: str           # 风险控制官的分析结果
-    final_report: str            # 最终综合报告
-    data_quality: str            # 数据质量摘要（验证节点填入，供报告节点引用）
-    error_messages: List[str]    # 错误信息收集（不中断流程，只记录）
-    current_step: str            # 当前执行步骤（供前端显示进度）
+    # Agent 解释层（LLM 只填这三段）
+    market_commentary:    str
+    sentiment_commentary: str
+    risk_commentary:      str
+
+    # 输出
+    final_report:  str
+    errors:        List[str]
+    warnings:      List[str]
+    current_step:  str
+
+    # 向后兼容旧版前端字段
+    fund_name:          str
+    fund_type:          str
+    actual_days:        int
+    is_new_fund:        bool
+    market_analysis:    str
+    sentiment_analysis: str
+    risk_analysis:      str
+    data_quality:       str
+    error_messages:     List[str]
 
 
 def _get_today() -> str:
-    """获取今天的日期字符串，注入 Prompt"""
     return datetime.now().strftime("%Y年%m月%d日")
 
 
@@ -93,20 +98,7 @@ def _create_llm(
     streaming: bool = True,
     enable_thinking: bool = False,
 ) -> ChatOpenAI:
-    """
-    创建 DeepSeek LLM 实例
-
-    可用模型：
-        deepseek-v4-flash  → 快速便宜，适合工具调用型 Agent
-        deepseek-v4-pro    → 更强推理，适合写最终报告
-
-    🌰 类比：
-        flash = 普通快递（够用、便宜、快）
-        pro   = 顺丰次日达（贵一点，但质量更好）
-
-    enable_thinking=True 时开启 deepseek-v4-pro 的思考模式，
-    会在内部先「打草稿」再输出，回答更深入但稍慢。
-    """
+    """创建 DeepSeek LLM 实例"""
     kwargs = dict(
         model=model_name,
         api_key=DEEPSEEK_API_KEY,
@@ -115,449 +107,564 @@ def _create_llm(
         streaming=streaming,
         max_tokens=8192,
     )
-
-    # 思考模式仅 deepseek-v4-pro 支持
-    # langchain-openai 1.x 支持直接传 reasoning_effort 参数
     if enable_thinking and model_name == "deepseek-v4-pro":
-        kwargs["reasoning_effort"] = "high"   # 可选: "low" / "medium" / "high"
-
+        kwargs["reasoning_effort"] = "high"
     return ChatOpenAI(**kwargs)
 
 
-def create_fund_analysis_graph():
+def create_fund_rag_graph():
     """
-    构建完整的 Multi-Agent 分析图
-
-    节点（Node）= 每一步要做的事
-    边（Edge）= 步骤之间的跳转关系
-
-    🌰 就像工厂的「流水线设计图」
-         原材料 → 车间A → 车间B → 车间C → 成品检验 → 出库
+    构建 V2.0 Multi-Agent 分析图（9 节点）
     """
-
-    # ---- 初始化 LLM（DeepSeek v4）----
-    # 三个工具调用 Agent：flash，速度优先，不需要深度推理
-    llm_fast = _create_llm(
-        model_name="deepseek-v4-flash",
-        temperature=0,
-        enable_thinking=False,
-    )
-    # 报告撰写 Agent：pro + 思考模式，质量优先
-    llm_strong = _create_llm(
-        model_name="deepseek-v4-pro",
-        temperature=0.1,
-        enable_thinking=True,
-    )
     today = _get_today()
-    year  = today[:4]   # 例："2026"，供 SENTIMENT prompt 搜索年份使用
+    year  = today[:4]
 
-    # ---- 创建四个专职 Sub-Agent ----
+    llm_fast = _create_llm("deepseek-v4-flash", temperature=0)
+    memory   = MemorySaver()
 
-    # Sub-Agent 1：行情分析师
-    # 🌰 配备数据查询类工具，就像给「数据分析师」配备 Excel 和数据库权限
-    # LangGraph 1.x 中 create_react_agent 的 prompt 参数替代了 state_modifier
+    # Sub-Agents（只做解释，不做计算）
     market_agent = create_react_agent(
         model=llm_fast,
-        tools=[
-            tool_get_fund_info,
-            tool_get_fund_performance,
-            tool_get_manager_info,
-            tool_compare_fund_ranking,
-        ],
-        prompt=MARKET_ANALYST_PROMPT.format(today=today),
+        tools=[],   # V2.0：不再查询工具，只解释 snapshot_json
+        prompt=MARKET_ANALYST_PROMPT,
     )
-
-    # Sub-Agent 2：舆情研究员
-    # 🌰 只配备新闻搜索工具，就像给「记者」只配备搜索引擎
     sentiment_agent = create_react_agent(
         model=llm_fast,
-        tools=[tool_search_fund_news],
+        tools=[tool_search_fund_news_balanced],
         prompt=SENTIMENT_ANALYST_PROMPT.format(today=today, year=year),
     )
-
-    # Sub-Agent 3：风险控制官
-    # 🌰 配备业绩数据和风险计算工具，就像给「风控官」配备风险模型
     risk_agent = create_react_agent(
         model=llm_fast,
-        tools=[
-            tool_get_fund_performance,
-            tool_calculate_risk_score,
-        ],
-        prompt=RISK_ANALYST_PROMPT.format(today=today),
+        tools=[],   # V2.0：不再调用工具，只解释 score_json
+        prompt=RISK_ANALYST_PROMPT,
     )
 
-    # Sub-Agent 4：报告撰写员
-    # 🌰 不需要工具，纯靠语言能力综合信息写报告
-    report_agent = create_react_agent(
-        model=llm_strong,
-        tools=[],
-        prompt=REPORT_WRITER_PROMPT,
-    )
+    # ============================================================
+    # 节点函数
+    # ============================================================
 
-    # ---- 定义节点函数 ----
-
-    def run_market_analysis(state: FundAnalysisState) -> dict:
+    def node_fetch_and_build_snapshot(state: FundRAGState) -> dict:
         """
-        节点1：运行行情分析
-        🌰 就像「行情部门」开始工作，查数据、算指标
+        拉取数据 → 构建 FundSnapshot → 序列化存入 state
+        🌰 类比：采购员把所有食材买齐、整理好，放进共享冰箱
         """
-        print(f"\n{'='*50}")
-        print(f"📊 [节点1] 行情分析师开始工作...")
-        print(f"   基金代码：{state['fund_code']}")
+        fund_code = state["fund_code"]
+        run_id    = state.get("run_id", "")
+        print(f"\n📡 [fetch_snapshot] 数据拉取：{fund_code} (run_id={run_id})")
 
-        query = (
-            f"请对基金代码 {state['fund_code']} 进行完整的行情分析。\n\n"
-            f"用户问题：{state['user_query']}\n\n"
-            f"必须按顺序调用：\n"
-            f"1. tool_get_fund_info 获取基本信息\n"
-            f"2. tool_get_fund_performance 获取业绩数据（注意读取返回的 actual_period_label 和 actual_days 字段）\n"
-            f"3. tool_get_manager_info（用步骤1返回的经理姓名，传入完整字符串）\n"
-            f"4. tool_compare_fund_ranking 获取同类排名\n\n"
-            f"输出报告时必须使用 actual_period_label 作为时间区间描述，禁止写「近3年」。"
-        )
-
+        from datetime import date
         try:
-            config = {"configurable": {"thread_id": f"market_{state['fund_code']}"}}
-            result = market_agent.invoke(
-                {"messages": [("human", query)]},
-                config=config,
-            )
-            analysis = result["messages"][-1].content
-            print(f"✅ [节点1] 行情分析完成，字数：{len(analysis)}")
-
-            # ✅ 从工具调用消息中提取 actual_days（解析 ToolMessage 的 JSON 内容）
-            actual_days = 0
-            is_new_fund = False
-            for msg in result.get("messages", []):
-                if hasattr(msg, "content") and isinstance(msg.content, str):
-                    try:
-                        data = json.loads(msg.content)
-                        if isinstance(data, dict) and "actual_days" in data:
-                            actual_days = int(data["actual_days"])
-                            is_new_fund = bool(data.get("is_new_fund", actual_days < 365))
-                            print(f"   [节点1] 提取到 actual_days={actual_days}, is_new_fund={is_new_fund}")
-                            break
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        pass
-
+            from backend.data_fetcher import fetch_fund_snapshot
+            snapshot = fetch_fund_snapshot(code=fund_code, report_date=date.today())
             return {
-                "market_analysis": analysis,
-                "actual_days":     actual_days,
-                "is_new_fund":     is_new_fund,
-                "current_step":    "行情分析完成 ✅",
+                "snapshot_json": snapshot.model_dump_json(),
+                # 向后兼容：填充旧版字段
+                "fund_name": snapshot.name or fund_code,
+                "fund_type": snapshot.fund_type or "混合型",
+                "current_step": "数据拉取完成 ✅",
             }
         except Exception as e:
-            error_msg = f"行情分析失败：{str(e)}"
-            print(f"❌ [节点1] {error_msg}")
+            err = f"数据拉取失败：{e}"
+            print(f"❌ [fetch_snapshot] {err}")
             return {
-                "market_analysis": f"行情分析暂时不可用：{error_msg}",
-                "actual_days":     0,
-                "is_new_fund":     False,
-                "error_messages":  state.get("error_messages", []) + [error_msg],
-                "current_step":    "行情分析失败 ❌",
+                "errors": state.get("errors", []) + [err],
+                "error_messages": state.get("error_messages", []) + [err],
+                "current_step": "数据拉取失败 ❌",
             }
 
-    def run_sentiment_analysis(state: FundAnalysisState) -> dict:
-        """
-        节点2：运行舆情分析
-        🌰 就像「舆情部门」开始刷新闻、看政策
-        """
-        print(f"\n{'='*50}")
-        print(f"📰 [节点2] 舆情研究员开始工作...")
+    def node_validate_data_quality(state: FundRAGState) -> dict:
+        """数据质量校验 + 写入 run_days"""
+        print("\n🔍 [validate_quality] 数据质量校验...")
 
-        # 从行情分析结果中提取基金名称，让舆情搜索更精准
-        # 🌰 类比：知道了「餐厅名字」再去搜评价，比搜「某餐厅」准确得多
-        fund_name = state.get("fund_name") or state["fund_code"]
+        if not state.get("snapshot_json"):
+            err = "snapshot_json 为空，跳过质量校验"
+            print(f"⚠️  {err}")
+            return {
+                "errors": state.get("errors", []) + [err],
+                "current_step": "数据校验跳过（无快照）",
+            }
 
-        # 尝试从行情分析文本中提取基金名称
-        market_text = state.get("market_analysis", "")
-        if "基金名称：" in market_text:
+        try:
+            from backend.data_quality import validate_snapshot
+            from backend.schemas import FundSnapshot
+
+            snapshot = FundSnapshot.model_validate_json(state["snapshot_json"])
+            quality  = validate_snapshot(snapshot)   # 会写入 snapshot.run_days
+
+            # 向后兼容字段
+            actual_days = snapshot.run_days or 0
+            is_new_fund = actual_days < 365 if actual_days > 0 else False
+
+            print(f"   质量等级：{quality.level}，矛盾数：{len(quality.contradictions)}")
+            return {
+                "snapshot_json":     snapshot.model_dump_json(),   # 含 run_days
+                "data_quality_json": quality.model_dump_json(),
+                "warnings":          state.get("warnings", []) + quality.warnings,
+                "actual_days":       actual_days,
+                "is_new_fund":       is_new_fund,
+                "current_step":      "数据校验完成 ✅",
+            }
+        except Exception as e:
+            err = f"数据质量校验失败：{e}"
+            print(f"❌ [validate_quality] {err}")
+            return {
+                "errors": state.get("errors", []) + [err],
+                "current_step": "数据校验失败 ❌",
+            }
+
+    def node_data_issue_report(state: FundRAGState) -> dict:
+        """数据矛盾时直接生成问题报告，不走正式评级"""
+        print("\n🔴 [data_issue_report] 数据矛盾，生成问题报告...")
+
+        try:
+            from backend.schemas import DataQualityReport, FundSnapshot
+            quality  = DataQualityReport.model_validate_json(state["data_quality_json"])
+            snapshot = FundSnapshot.model_validate_json(state["snapshot_json"])
+
+            report = f"""# ⛔ {state['fund_code']} 数据一致性问题报告
+
+**报告日期：** {snapshot.report_date}
+**基金名称：** {snapshot.name or "未知"}
+
+## 检测到的数据矛盾
+
+以下矛盾导致本次分析无法输出正式评级：
+
+{chr(10).join(f"- {c}" for c in quality.contradictions)}
+
+## 建议
+
+1. 请等待 akshare 数据接口更新后重新分析
+2. 或前往基金公司官方网站核实数据
+3. 如为缓存问题，请清空 cache/ 目录后重试
+
+---
+*本报告由 FundRAG Multi-Agent System V2.0 生成*
+"""
+            return {
+                "final_report": report,
+                # 向后兼容
+                "market_analysis": "数据存在矛盾，已停止分析",
+                "sentiment_analysis": "数据存在矛盾，已停止分析",
+                "risk_analysis": "数据存在矛盾，已停止分析",
+                "current_step": "数据问题报告已生成",
+            }
+        except Exception as e:
+            err = f"数据问题报告生成失败：{e}"
+            return {
+                "final_report": f"数据质量存在矛盾，无法生成报告。错误：{err}",
+                "current_step": "数据问题报告生成失败",
+            }
+
+    def node_compute_scores(state: FundRAGState) -> dict:
+        """确定性评分（代码计算，不依赖 LLM）"""
+        print("\n📊 [scoring_node] 确定性评分计算...")
+
+        if not state.get("snapshot_json") or not state.get("data_quality_json"):
+            # 降级：无数据时给默认分
+            from backend.schemas import (
+                DataQualityReport, DataQualityLevel, FundSnapshot
+            )
+            from datetime import date
+            dummy_snapshot = FundSnapshot(code=state["fund_code"], report_date=date.today())
+            dummy_quality = DataQualityReport(
+                level=DataQualityLevel.PARTIAL,
+                missing_fields=["nav", "max_drawdown", "return_since_inception", "inception_date"],
+            )
+            from backend.scoring import score_fund
+            score = score_fund(dummy_snapshot, dummy_quality)
+            return {"score_json": score.model_dump_json(), "current_step": "评分计算完成（降级）"}
+
+        try:
+            from backend.schemas import FundSnapshot, DataQualityReport
+            from backend.scoring import score_fund
+
+            snapshot = FundSnapshot.model_validate_json(state["snapshot_json"])
+            quality  = DataQualityReport.model_validate_json(state["data_quality_json"])
+            score    = score_fund(snapshot, quality, sentiment_score=5.0)
+
+            print(f"   评分：{score.total_score}/10，评级：{score.rating}，置信度：{score.confidence}")
+            return {
+                "score_json":   score.model_dump_json(),
+                "current_step": "评分计算完成 ✅",
+            }
+        except Exception as e:
+            err = f"评分计算失败：{e}"
+            print(f"❌ [scoring_node] {err}")
+            return {
+                "errors":       state.get("errors", []) + [err],
+                "current_step": "评分计算失败 ❌",
+            }
+
+    def node_market_agent(state: FundRAGState) -> dict:
+        """行情 Agent：只做解释，数字全部引用 snapshot_json"""
+        print("\n📊 [market_agent] 行情分析（解释层）...")
+        fund_code = state["fund_code"]
+        run_id    = state.get("run_id", "")
+
+        snapshot_json = state.get("snapshot_json", "{}")
+
+        query = f"""
+以下是基金 {fund_code} 的完整数据 JSON，请基于此写行情分析解释：
+
+```json
+{snapshot_json}
+```
+
+⚠️ 严格规则：
+1. 只能引用 JSON 中已有的数字，禁止自行计算或编造数字
+2. 禁止使用「近3年」，使用 return_since_inception 时注明「自成立以来」
+3. 若字段 is_mock=true，引用时必须加「（模拟数据）」
+4. 若 run_days < 365，首句必须加粗说明「⚠️ 次新基金，数据参考价值有限」
+5. managers 字段若有多个，逐一介绍，名字来自 name 字段
+6. 用户问题（如有）：{state.get('user_question', '请进行全面分析')}
+
+输出：400字以内的行情分析解释文字，不含表格（表格由系统模板生成）
+"""
+
+        try:
+            config = {"configurable": {"thread_id": f"market_{fund_code}_{run_id}"}}
+            result = market_agent.invoke({"messages": [("human", query)]}, config=config)
+            content = result["messages"][-1].content
+            print(f"✅ [market_agent] 完成，字数：{len(content)}")
+            return {
+                "market_commentary": content,
+                "market_analysis":   content,   # 向后兼容
+                "current_step":      "行情分析完成 ✅",
+            }
+        except Exception as e:
+            err = f"行情分析失败：{e}"
+            print(f"❌ [market_agent] {err}")
+            return {
+                "market_commentary": f"行情分析失败：{err}",
+                "market_analysis":   f"行情分析失败：{err}",
+                "errors":            state.get("errors", []) + [err],
+                "error_messages":    state.get("error_messages", []) + [err],
+                "current_step":      "行情分析失败 ❌",
+            }
+
+    def node_sentiment_agent(state: FundRAGState) -> dict:
+        """舆情 Agent：多空平衡分析 + 输出 SENTIMENT_SCORE"""
+        print("\n📰 [sentiment_agent] 舆情分析...")
+        fund_code = state["fund_code"]
+        run_id    = state.get("run_id", "")
+
+        # 从 snapshot 获取基金名称和类型
+        fund_name = state.get("fund_name", fund_code)
+        fund_type = state.get("fund_type", "混合型")
+        if state.get("snapshot_json"):
             try:
-                start = market_text.index("基金名称：") + len("基金名称：")
-                end = market_text.index("\n", start)
-                fund_name = market_text[start:end].strip().split("（")[0].strip()
+                from backend.schemas import FundSnapshot
+                snap = FundSnapshot.model_validate_json(state["snapshot_json"])
+                fund_name = snap.name or fund_name
+                fund_type = snap.fund_type or fund_type
             except Exception:
                 pass
 
-        query = (
-            f"请对基金「{fund_name}」（代码：{state['fund_code']}）进行舆情分析。\n\n"
-            f"搜索策略（请至少搜索3次）：\n"
-            f"1. 搜索「{fund_name} 最新消息 2026」\n"
-            f"2. 搜索「{fund_name} 所属行业 政策 2026」（先判断该基金主投什么行业）\n"
-            f"3. 搜索「{fund_name} 基金公司 动态」\n\n"
-            f"综合输出舆情分析报告。"
-        )
+        query = f"""
+请对基金「{fund_name}」（{fund_code}）进行多空平衡的舆情分析。
+
+⚠️ 只能分析 {fund_code}，禁止引用其他基金的数据。
+
+请调用 tool_search_fund_news_balanced：
+- fund_name: "{fund_name}"
+- fund_industry: "{fund_type}"
+
+根据搜索结果，输出：
+1. 情绪评分（0-10 的数字，10 最乐观）
+2. 情绪分析文字（多空平衡，必须包含「反面观点」小节）
+
+格式：
+SENTIMENT_SCORE: [0-10 的数字]
+---
+[分析文字]
+"""
 
         try:
-            config = {"configurable": {"thread_id": f"sentiment_{state['fund_code']}"}}
-            result = sentiment_agent.invoke(
-                {"messages": [("human", query)]},
-                config=config,
-            )
-            analysis = result["messages"][-1].content
-            print(f"✅ [节点2] 舆情分析完成，字数：{len(analysis)}")
+            config = {"configurable": {"thread_id": f"sentiment_{fund_code}_{run_id}"}}
+            result = sentiment_agent.invoke({"messages": [("human", query)]}, config=config)
+            content = result["messages"][-1].content
+
+            # 提取情绪分数
+            score_match = re.search(r"SENTIMENT_SCORE:\s*(\d+(?:\.\d+)?)", content)
+            sentiment_score = float(score_match.group(1)) if score_match else 5.0
+            sentiment_score = max(0.0, min(10.0, sentiment_score))
+
+            # 去掉 SENTIMENT_SCORE 行，只保留解释文字
+            commentary = re.sub(r"SENTIMENT_SCORE:.*\n?---\n?", "", content).strip()
+
+            print(f"✅ [sentiment_agent] 完成，SENTIMENT_SCORE={sentiment_score}")
+
+            # 用实际情绪分重新计算总分（如果有 snapshot 和 quality）
+            new_score_json = state.get("score_json", "")
+            if state.get("snapshot_json") and state.get("data_quality_json"):
+                try:
+                    from backend.schemas import FundSnapshot, DataQualityReport
+                    from backend.scoring import score_fund
+                    snapshot = FundSnapshot.model_validate_json(state["snapshot_json"])
+                    quality  = DataQualityReport.model_validate_json(state["data_quality_json"])
+                    new_score = score_fund(snapshot, quality, sentiment_score=sentiment_score)
+                    new_score_json = new_score.model_dump_json()
+                    print(f"   更新总分：{new_score.total_score}/10，评级：{new_score.rating}")
+                except Exception as e:
+                    print(f"⚠️ 情绪分更新总分失败（保留原分）：{e}")
+
             return {
-                "sentiment_analysis": analysis,
-                "fund_name": fund_name,  # 回写基金名称供后续节点使用
-                "current_step": "舆情分析完成 ✅",
+                "sentiment_commentary": commentary,
+                "sentiment_analysis":   commentary,   # 向后兼容
+                "score_json":           new_score_json,
+                "current_step":         "舆情分析完成 ✅",
             }
         except Exception as e:
-            error_msg = f"舆情分析失败：{str(e)}"
-            print(f"❌ [节点2] {error_msg}")
+            err = f"舆情分析失败：{e}"
+            print(f"❌ [sentiment_agent] {err}")
             return {
-                "sentiment_analysis": f"舆情分析暂时不可用：{error_msg}",
-                "error_messages": state.get("error_messages", []) + [error_msg],
-                "current_step": "舆情分析失败 ❌",
+                "sentiment_commentary": f"舆情分析失败：{err}",
+                "sentiment_analysis":   f"舆情分析失败：{err}",
+                "errors":               state.get("errors", []) + [err],
+                "error_messages":       state.get("error_messages", []) + [err],
+                "current_step":         "舆情分析失败 ❌",
             }
 
-    def run_risk_analysis(state: FundAnalysisState) -> dict:
-        """
-        节点3：运行风险分析
-        🌰 就像「风控部门」给基金做体检，量血压、测心率
-        """
-        print(f"\n{'='*50}")
-        print(f"⚠️  [节点3] 风险控制官开始工作...")
+    def node_risk_agent(state: FundRAGState) -> dict:
+        """风控 Agent：解释后端计算出的风险分，不重新计算"""
+        print("\n⚠️  [risk_agent] 风险解释...")
+        fund_code = state["fund_code"]
+        run_id    = state.get("run_id", "")
 
-        actual_days = state.get("actual_days", 0)
+        query = f"""
+以下是基金 {fund_code} 的评分 JSON，请解释风险来源：
 
-        query = (
-            f"请对基金代码 {state['fund_code']} 进行风险评估。\n\n"
-            f"已知该基金实际运行天数为 {actual_days} 天。\n\n"
-            f"步骤（严格按顺序）：\n"
-            f"1. 调用 tool_get_fund_performance 获取 max_drawdown_pct 和 total_return_pct\n"
-            f"2. 调用 tool_calculate_risk_score，参数：\n"
-            f"   - max_drawdown = 从步骤1获取的最大回撤数值（浮点数，如 25.3）\n"
-            f"   - return_rate  = 从步骤1获取的总收益率数值（浮点数，如 45.2）\n"
-            f"   - fund_type    = 基金类型（如「股票型」「混合型」）\n"
-            f"   - actual_days  = {actual_days}    ← 必须传入此值，不得省略\n"
-            f"3. 综合输出多维度风险评估报告\n\n"
-            f"参考行情分析结论：\n{state.get('market_analysis', '暂无')[:500]}"
-        )
+评分结果：
+```json
+{state.get("score_json", "{}")}
+```
+
+快照数据（仅用于引用）：
+```json
+{state.get("snapshot_json", "{}")}
+```
+
+⚠️ 严格规则：
+1. 禁止修改评分数字
+2. 禁止忽略 data_penalty（数据不足惩罚）
+3. 若 run_days < 365，「数据充分性风险」必须列为首要风险
+4. 禁止出现「建议买入/卖出/持有」
+5. 只解释，不重新计算
+
+输出：300字以内的风险解释文字，不含表格
+"""
 
         try:
-            config = {"configurable": {"thread_id": f"risk_{state['fund_code']}"}}
-            result = risk_agent.invoke(
-                {"messages": [("human", query)]},
-                config=config,
-            )
-            analysis = result["messages"][-1].content
-            print(f"✅ [节点3] 风险评估完成，字数：{len(analysis)}")
+            config = {"configurable": {"thread_id": f"risk_{fund_code}_{run_id}"}}
+            result = risk_agent.invoke({"messages": [("human", query)]}, config=config)
+            content = result["messages"][-1].content
+            print(f"✅ [risk_agent] 完成，字数：{len(content)}")
             return {
-                "risk_analysis": analysis,
-                "current_step": "风险评估完成 ✅",
+                "risk_commentary": content,
+                "risk_analysis":   content,   # 向后兼容
+                "current_step":    "风险分析完成 ✅",
             }
         except Exception as e:
-            error_msg = f"风险分析失败：{str(e)}"
-            print(f"❌ [节点3] {error_msg}")
+            err = f"风险分析失败：{e}"
+            print(f"❌ [risk_agent] {err}")
             return {
-                "risk_analysis": f"风险分析暂时不可用：{error_msg}",
-                "error_messages": state.get("error_messages", []) + [error_msg],
-                "current_step": "风险评估失败 ❌",
+                "risk_commentary":  f"风险分析失败：{err}",
+                "risk_analysis":    f"风险分析失败：{err}",
+                "errors":           state.get("errors", []) + [err],
+                "error_messages":   state.get("error_messages", []) + [err],
+                "current_step":     "风险评估失败 ❌",
             }
 
-    def validate_data_quality(state: FundAnalysisState) -> dict:
-        """
-        节点3.5：数据质量验证（行情分析后、舆情分析前插入）
-        检查哪些数据是真实 akshare 数据，哪些是 mock 数据，
-        生成 data_quality 摘要供后续报告节点引用。
-        🌰 类比：「质检员」在流水线上检查食材来源，贴上「真实/模拟」标签
-        """
-        print(f"\n{'='*50}")
-        print(f"🔍 [验证节点] 数据质量检查...")
-
-        market = state.get("market_analysis", "")
-
-        has_real_data = "akshare实时数据" in market or (
-            "akshare" in market and "mock" not in market.lower() and "模拟" not in market
-        )
-        has_mock_data = (
-            "mock" in market.lower()
-            or "模拟数据" in market
-            or "数据获取失败" in market
-        )
-
-        issues = []
-        if "业绩获取失败" in market or "模拟数据" in market:
-            issues.append("业绩数据含模拟值")
-        if "经理" in market and ("未知" in market or "模拟" in market):
-            issues.append("基金经理信息不完整")
-        if "排名" in market and "模拟" in market:
-            issues.append("同类排名为估算值")
-
-        if not issues:
-            completeness = "完整（akshare实时数据）"
-            quality_notice = "✅ 本报告所有量化数据均来自 akshare 实时接口，数据可信。"
-        else:
-            completeness = f"部分缺失（含模拟数据：{', '.join(issues)}）"
-            quality_notice = (
-                f"⚠️ 以下数据项使用了估算/模拟值（※标注处仅供参考）：\n"
-                + "\n".join(f"- {i}" for i in issues)
-                + "\n\n建议：如需精确数据，请稍后重试或直接查询基金公司官网。"
-            )
-
-        print(f"   数据完整性：{completeness}")
-        return {
-            "data_quality": quality_notice,
-            "current_step": "数据质量验证完成 ✅",
-        }
-
-    def run_report_generation(state: FundAnalysisState) -> dict:
-        """
-        节点4：汇总生成最终报告
-        🌰 就像「报告员」把三份分析综合成一份完整报告，交给老板
-        """
-        print(f"\n{'='*50}")
-        print(f"📝 [节点4] 报告撰写员开始汇总...")
-
-        # ✅ 根据具体状态字段构建数据质量说明（比文本分析更准确）
-        actual_days = state.get("actual_days", 0)
-        is_new_fund = state.get("is_new_fund", False)
-        errors      = state.get("error_messages", [])
-
-        if is_new_fund:
-            data_quality_notice = (
-                f"⚠️ **次新基金警告**：该基金仅运行 {actual_days} 天，"
-                f"所有历史业绩、排名及风险指标均不具备统计显著性，"
-                f"请以官方基金公告为准，本报告分析结论参考价值有限。"
-            )
-        elif errors:
-            data_quality_notice = (
-                f"部分数据获取失败（{len(errors)}项），已使用模拟数据填充，"
-                f"相关指标仅供参考，请以官方渠道数据为准。"
-            )
-        else:
-            data_quality_notice = "✅ 本报告所有量化数据均来自 akshare 实时接口，数据可信。"
-
-        synthesis_query = (
-            f"请综合以下三份分析报告，生成最终的基金投研报告：\n\n"
-            f"{'='*40}\n"
-            f"【行情分析报告】\n{state.get('market_analysis', '数据获取失败')}\n\n"
-            f"{'='*40}\n"
-            f"【舆情分析报告】\n{state.get('sentiment_analysis', '数据获取失败')}\n\n"
-            f"{'='*40}\n"
-            f"【风险评估报告】\n{state.get('risk_analysis', '数据获取失败')}\n\n"
-            f"{'='*40}\n"
-            f"基金代码：{state['fund_code']}\n"
-            f"基金实际运行天数：{actual_days}天（{'次新基金，禁止给出买入评级' if is_new_fund else '数据有效'}）\n"
-            f"用户原始问题：{state['user_query']}\n\n"
-            f"请将以下内容填入报告「七、数据质量说明」章节（直接替换 {{DATA_QUALITY_NOTICE}}）：\n"
-            f"{data_quality_notice}"
-        )
+    def node_render_report(state: FundRAGState) -> dict:
+        """用模板渲染最终报告，不依赖 LLM 生成结构"""
+        print("\n📝 [render_report] 渲染最终报告...")
 
         try:
-            config = {"configurable": {"thread_id": f"report_{state['fund_code']}"}}
-            result = report_agent.invoke(
-                {"messages": [("human", synthesis_query)]},
-                config=config,
+            from backend.schemas import FundSnapshot, DataQualityReport, ScoreBreakdown
+            from backend.report_renderer import render_report
+            from backend.output_guard import validate_report, auto_fix_report
+            from datetime import date
+
+            # 获取或构建所需对象
+            snapshot = (FundSnapshot.model_validate_json(state["snapshot_json"])
+                        if state.get("snapshot_json")
+                        else FundSnapshot(code=state["fund_code"], report_date=date.today()))
+
+            quality = (DataQualityReport.model_validate_json(state["data_quality_json"])
+                       if state.get("data_quality_json")
+                       else None)
+
+            score = (ScoreBreakdown.model_validate_json(state["score_json"])
+                     if state.get("score_json")
+                     else None)
+
+            if quality is None or score is None:
+                # 降级到文本汇总模式
+                raise ValueError("缺少 quality 或 score，降级处理")
+
+            raw_report = render_report(
+                snapshot=snapshot,
+                quality=quality,
+                score=score,
+                market_commentary=state.get("market_commentary", "数据获取失败"),
+                sentiment_commentary=state.get("sentiment_commentary", "数据获取失败"),
+                risk_commentary=state.get("risk_commentary", "数据获取失败"),
             )
-            final_report = result["messages"][-1].content
 
-            # ✅ 兜底替换：防止 LLM 未替换占位符
-            final_report = final_report.replace("{DATA_QUALITY_NOTICE}", data_quality_notice)
+            # 自动修复幻觉词
+            fixed_report, fix_log = auto_fix_report(raw_report)
+            if fix_log:
+                print(f"  自动修复：{fix_log}")
 
-            print(f"✅ [节点4] 报告生成完成，字数：{len(final_report)}")
+            # 质量校验
+            is_valid, guard_errors = validate_report(fixed_report)
+            if not is_valid:
+                print(f"  ⚠️ 质量守卫警告：{guard_errors}")
+                fixed_report += f"\n\n---\n> ⚠️ 系统质量校验警告：{'; '.join(guard_errors)}"
+
+            print(f"✅ [render_report] 完成，字数：{len(fixed_report)}")
             print(f"\n🎉 全部节点执行完毕！")
+
             return {
-                "final_report":  final_report,
-                "data_quality":  data_quality_notice,
-                "current_step":  "报告生成完成 🎉",
+                "final_report":   fixed_report,
+                "warnings":       state.get("warnings", []) + (fix_log if fix_log else []),
+                "data_quality":   state.get("data_quality_json", ""),
+                "current_step":   "报告生成完成 🎉",
             }
         except Exception as e:
-            error_msg = f"报告生成失败：{str(e)}"
-            print(f"❌ [节点4] {error_msg}")
+            err = f"报告渲染失败：{e}"
+            print(f"❌ [render_report] {err}")
+
+            # 降级报告
             fallback_report = (
-                f"# 📋 基金分析报告（自动降级版）\n\n"
-                f"> 报告生成失败，以下为各子模块原始输出\n\n"
-                f"## 行情分析\n{state.get('market_analysis', '无数据')}\n\n"
-                f"## 舆情分析\n{state.get('sentiment_analysis', '无数据')}\n\n"
-                f"## 风险评估\n{state.get('risk_analysis', '无数据')}\n"
+                f"# 📋 基金分析报告（降级版）\n\n"
+                f"> 模板渲染失败，以下为各子模块原始输出\n\n"
+                f"## 行情分析\n{state.get('market_commentary', state.get('market_analysis', '无数据'))}\n\n"
+                f"## 舆情分析\n{state.get('sentiment_commentary', state.get('sentiment_analysis', '无数据'))}\n\n"
+                f"## 风险评估\n{state.get('risk_commentary', state.get('risk_analysis', '无数据'))}\n\n"
+                f"## ⚠️ 风险提示\n本报告由AI系统自动生成，不构成任何投资建议。\n"
             )
             return {
-                "final_report":   fallback_report,
-                "error_messages": state.get("error_messages", []) + [error_msg],
-                "current_step":   "报告生成失败（已降级）❌",
+                "final_report":  fallback_report,
+                "errors":        state.get("errors", []) + [err],
+                "error_messages": state.get("error_messages", []) + [err],
+                "current_step":  "报告生成失败（已降级）❌",
             }
 
-    # ---- 构建状态图 ----
-    # 🌰 类比：画出「工厂流水线图」，标注每道工序的顺序
-    workflow = StateGraph(FundAnalysisState)
+    # ============================================================
+    # 路由函数：数据矛盾 → 问题报告；否则 → 正常流程
+    # ============================================================
+    def route_after_quality(state: FundRAGState) -> str:
+        if not state.get("data_quality_json"):
+            return "scoring_node"   # 无质量报告时继续（降级）
+        try:
+            from backend.schemas import DataQualityReport
+            quality = DataQualityReport.model_validate_json(state["data_quality_json"])
+            if quality.contradictions:
+                return "data_issue_report"
+        except Exception:
+            pass
+        return "scoring_node"
 
-    # 添加节点
-    workflow.add_node("market_analysis", run_market_analysis)
-    workflow.add_node("validate_data", validate_data_quality)   # 新增：数据质量验证
-    workflow.add_node("sentiment_analysis", run_sentiment_analysis)
-    workflow.add_node("risk_analysis", run_risk_analysis)
-    workflow.add_node("report_generation", run_report_generation)
+    # ============================================================
+    # 构建图
+    # ============================================================
+    workflow = StateGraph(FundRAGState)
 
-    # 设置入口：从行情分析开始
-    workflow.set_entry_point("market_analysis")
+    workflow.add_node("fetch_snapshot",    node_fetch_and_build_snapshot)
+    workflow.add_node("validate_quality",  node_validate_data_quality)
+    workflow.add_node("data_issue_report", node_data_issue_report)
+    workflow.add_node("scoring_node",      node_compute_scores)
+    workflow.add_node("market_agent",      node_market_agent)
+    workflow.add_node("sentiment_agent",   node_sentiment_agent)
+    workflow.add_node("risk_agent",        node_risk_agent)
+    workflow.add_node("render_report",     node_render_report)
 
-    # 定义执行顺序（流水线）
-    # 🌰 行情 → 数据验证 → 舆情 → 风控 → 报告
-    workflow.add_edge("market_analysis", "validate_data")        # 验证节点插入行情之后
-    workflow.add_edge("validate_data", "sentiment_analysis")
-    workflow.add_edge("sentiment_analysis", "risk_analysis")
-    workflow.add_edge("risk_analysis", "report_generation")
-    workflow.add_edge("report_generation", END)
+    workflow.set_entry_point("fetch_snapshot")
+    workflow.add_edge("fetch_snapshot", "validate_quality")
 
-    # 编译成可执行的图（不用 checkpointer，用外部 session_id 管理）
-    app = workflow.compile()
+    # ✅ 关键分支：数据矛盾时走问题报告
+    workflow.add_conditional_edges(
+        "validate_quality",
+        route_after_quality,
+        {
+            "data_issue_report": "data_issue_report",
+            "scoring_node":      "scoring_node",
+        }
+    )
 
-    print("✅ FundRAG Multi-Agent 图构建完成")
-    print("   节点数量：5 个")
-    print("   执行顺序：行情分析 → 数据验证 → 舆情分析 → 风险评估 → 报告生成")
+    workflow.add_edge("data_issue_report", END)
+    workflow.add_edge("scoring_node",      "market_agent")
+    workflow.add_edge("market_agent",      "sentiment_agent")
+    workflow.add_edge("sentiment_agent",   "risk_agent")
+    workflow.add_edge("risk_agent",        "render_report")
+    workflow.add_edge("render_report",     END)
 
-    return app
+    print("✅ FundRAG V2.0 Multi-Agent 图构建完成")
+    print("   节点数量：8 个")
+    print("   执行顺序：fetch_snapshot → validate_quality → scoring_node → market_agent → sentiment_agent → risk_agent → render_report")
+
+    return workflow.compile(checkpointer=memory)
 
 
-def run_fund_analysis(fund_code: str, user_query: str, session_id: str = "default") -> dict:
+def run_fund_analysis(fund_code: str, user_question: str = "", session_id: str = "default", user_query: str = "") -> dict:
     """
     执行完整的基金分析流程（对外统一入口）
 
-    参数:
-        fund_code:  基金代码，如 "110022"
-        user_query: 用户问题，如 "这只基金值得投资吗？"
-        session_id: 会话 ID（保留参数，当前版本不做跨次记忆）
+    ✅ P0 修复：每次调用生成唯一 run_id，彻底隔离不同分析
+    向后兼容：接受 user_query 参数（旧版 app.py 使用）
 
-    返回:
-        FundAnalysisState 字典，包含完整分析结果
-
-    🌰 使用示例：
-        result = run_fund_analysis("110022", "帮我分析这只基金")
-        print(result["final_report"])
+    🌰 类比：每次开一张全新白板，扔掉旧白板
     """
+    # 兼容旧版 user_query 参数
+    if not user_question and user_query:
+        user_question = user_query
 
-    # 初始化状态，所有字段必须赋值（TypedDict 要求）
-    initial_state: FundAnalysisState = {
-        "fund_code":         fund_code.strip(),
-        "fund_name":         fund_code.strip(),   # 分析过程中会自动更新为真实名称
-        "fund_type":         "混合型",             # 分析过程中会自动更新
-        "user_query":        user_query,
-        "actual_days":       0,                   # 行情节点执行后填入
-        "is_new_fund":       False,               # 行情节点执行后填入
-        "market_analysis":   "",
-        "sentiment_analysis": "",
-        "risk_analysis":     "",
-        "final_report":      "",
-        "data_quality":      "",
-        "error_messages":    [],
-        "current_step":      "开始分析...",
+    # ✅ P0 核心修复：唯一 run_id
+    run_id = f"{fund_code}_{int(time.time())}_{uuid.uuid4().hex[:6]}"
+
+    initial_state: FundRAGState = {
+        "fund_code":           fund_code.strip(),
+        "user_question":       user_question or "请进行全面分析",
+        "run_id":              run_id,
+        # ✅ 显式初始化所有字段，防止读取任何历史残留
+        "snapshot_json":       "",
+        "data_quality_json":   "",
+        "score_json":          "",
+        "market_commentary":   "",
+        "sentiment_commentary": "",
+        "risk_commentary":     "",
+        "final_report":        "",
+        "errors":              [],
+        "warnings":            [],
+        "current_step":        "初始化...",
+        # 向后兼容字段
+        "fund_name":           fund_code.strip(),
+        "fund_type":           "混合型",
+        "actual_days":         0,
+        "is_new_fund":         False,
+        "market_analysis":     "",
+        "sentiment_analysis":  "",
+        "risk_analysis":       "",
+        "data_quality":        "",
+        "error_messages":      [],
     }
 
     print(f"\n{'#'*50}")
-    print(f"🚀 开始分析基金：{fund_code}")
-    print(f"   用户问题：{user_query}")
-    print(f"   会话 ID：{session_id}")
+    print(f"🚀 V2.0 开始分析基金：{fund_code}")
+    print(f"   用户问题：{user_question}")
+    print(f"   run_id：{run_id}")
     print(f"{'#'*50}")
 
-    graph = create_fund_analysis_graph()
-    final_state = graph.invoke(initial_state)
+    graph = create_fund_rag_graph()
+    # ✅ config 使用唯一 run_id
+    config = {"configurable": {"thread_id": run_id}}
+    final_state = graph.invoke(initial_state, config=config)
 
-    error_count = len(final_state.get("error_messages", []))
+    error_count = len(final_state.get("errors", final_state.get("error_messages", [])))
     print(f"\n{'#'*50}")
-    print(f"🏁 分析完成！错误数量：{error_count}")
-    if error_count > 0:
-        print(f"   错误详情：{final_state['error_messages']}")
+    print(f"🏁 V2.0 分析完成！错误数量：{error_count}")
     print(f"{'#'*50}\n")
 
     return final_state

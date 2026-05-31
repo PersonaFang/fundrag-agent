@@ -259,12 +259,84 @@ def tool_compare_fund_ranking(fund_code: str, fund_type: str) -> str:
         return f"排名查询失败：{str(e)}"
 
 
+# ============ 工具7：多空平衡新闻搜索（V2.0 新增）============
+@tool
+def tool_search_fund_news_balanced(fund_name: str, fund_industry: str) -> str:
+    """
+    对基金进行多空平衡的新闻搜索。
+    强制执行两次搜索：正面（利好/增长）+ 负面（风险/利空）。
+    输入：基金名称 + 主要投资行业。
+    返回：包含 positive 和 negative 两个维度的新闻 JSON。
+    当需要全面评估市场情绪时使用（不能只看利好，必须同时搜索利空）。
+
+    🌰 类比：律师辩护前必须同时研究有利和不利证据
+    """
+    try:
+        client = _get_tavily_client()
+        results = {"positive": [], "negative": [], "neutral": []}
+
+        # 第一次：正面搜索
+        pos_results = client.search(
+            query=f"{fund_name} {fund_industry} 利好 增长 上涨 2026",
+            search_depth="basic",
+            max_results=3,
+            include_domains=[
+                "eastmoney.com", "xueqiu.com", "sina.com.cn",
+                "163.com", "10jqka.com.cn", "caixin.com"
+            ]
+        )
+        for r in pos_results.get("results", []):
+            results["positive"].append({
+                "title":          r.get("title", ""),
+                "snippet":        r.get("content", "")[:200],
+                "url":            r.get("url", ""),
+                "published_date": r.get("published_date", "未知"),
+                "sentiment":      "positive"
+            })
+
+        # 第二次：负面搜索（强制执行，不可省略）
+        neg_results = client.search(
+            query=f"{fund_name} {fund_industry} 风险 利空 回调 估值偏高 2026",
+            search_depth="basic",
+            max_results=3,
+            include_domains=[
+                "eastmoney.com", "xueqiu.com", "sina.com.cn",
+                "163.com", "10jqka.com.cn", "caixin.com"
+            ]
+        )
+        for r in neg_results.get("results", []):
+            results["negative"].append({
+                "title":          r.get("title", ""),
+                "snippet":        r.get("content", "")[:200],
+                "url":            r.get("url", ""),
+                "published_date": r.get("published_date", "未知"),
+                "sentiment":      "negative"
+            })
+
+        results["summary"] = {
+            "positive_count": len(results["positive"]),
+            "negative_count": len(results["negative"]),
+            "balance_note":   "已执行多空平衡搜索，请综合两侧信息判断市场情绪"
+        }
+
+        return json.dumps(results, ensure_ascii=False, indent=2)
+
+    except Exception as e:
+        return json.dumps({
+            "error": str(e),
+            "positive": [],
+            "negative": [],
+            "summary": {"balance_note": "搜索失败，请手动核查"}
+        }, ensure_ascii=False)
+
+
 # ============ 导出所有工具（供 Agent 使用）============
 ALL_TOOLS = [
     tool_get_fund_info,
     tool_get_fund_performance,
     tool_get_manager_info,
     tool_search_fund_news,
+    tool_search_fund_news_balanced,
     tool_calculate_risk_score,
     tool_compare_fund_ranking,
 ]

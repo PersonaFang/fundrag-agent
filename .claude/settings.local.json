@@ -2,7 +2,15 @@
   "permissions": {
     "allow": [
       "Bash(wc *)",
-      "Bash(pip show *)"
+      "Bash(pip show *)",
+      "Bash(python *)",
+      "Bash(pip install *)",
+      "Bash(conda run *)",
+      "Bash(conda env *)",
+      "Bash(ls /home/fang/projects/fundrag-agent/venv/lib/python*/site-packages/)",
+      "Bash(/home/fang/projects/fundrag-agent/venv/bin/python -c \"import akshare; print\\(akshare.__version__\\)\")",
+      "Bash(/home/fang/projects/fundrag-agent/venv/bin/python *)",
+      "Bash(/home/fang/projects/fundrag-agent/venv/bin/pip install *)"
     ]
   }
 }
