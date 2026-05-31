@@ -295,7 +295,8 @@ def main():
             # 顶部操作栏
             col_title, col_export = st.columns([3, 1])
             with col_title:
-                st.subheader(f"📋 基金 {fund_code_display} 投研报告")
+                fund_display_name = result.get("fund_name", fund_code_display)
+                st.subheader(f"📋 {fund_display_name} 投研报告")
             with col_export:
                 report_content = result.get("final_report", "")
                 if report_content:
@@ -313,6 +314,12 @@ def main():
             ])
 
             with tab_final:
+                # 次新基金额外提示
+                if result.get("is_new_fund"):
+                    st.warning(
+                        f"⚠️ **次新基金提示**：该基金运行仅 {result.get('actual_days', 0)} 天，"
+                        "报告中所有历史业绩指标参考价值有限，请谨慎参考。"
+                    )
                 final_report = result.get("final_report", "报告生成中...")
                 st.markdown(final_report)
 

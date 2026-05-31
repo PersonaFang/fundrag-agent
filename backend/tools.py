@@ -149,33 +149,26 @@ def tool_search_fund_news(query: str) -> str:
 @tool
 def tool_calculate_risk_score(
     max_drawdown: float,
-    return_rate: float,
-    fund_type: str
+    return_rate:  float,
+    fund_type:    str,
+    actual_days:  int = 1095    # ✅ 新增：基金实际运行天数，默认3年(1095天)
 ) -> str:
     """
-    根据基金的最大回撤、收益率和类型，计算综合风险评分（1-10分，10分最高风险）。
-    参数：max_drawdown（最大回撤%，如 25.3），return_rate（近3年总收益率%，如 45.2），fund_type（基金类型，如「股票型」）。
+    根据基金的最大回撤、收益率、类型和实际运行天数，计算综合风险评分（1-10分，10分最高风险）。
+    参数：max_drawdown（最大回撤%），return_rate（收益率%），fund_type（基金类型），actual_days（实际运行天数）。
+    次新基金（actual_days < 730）会加入数据不足惩罚项，避免因历史短而低估风险。
     当需要给基金「打风险分」时使用此工具。
 
-    🌰 类比：给基金做「体检报告」
-         最大回撤高 → 容易心脏病发作（高风险）
-         收益率低 → 身体素质差（性价比低）
+    🌰 类比：给基金做「体检报告」，同时考虑「体检数据是否足够多」
     """
     try:
-        # 1. 回撤评分（最大回撤越大，风险越高）
-        # 🌰 回撤5%以下=轻微感冒，30%以上=重病住院
-        if max_drawdown < 5:
-            drawdown_score = 1
-        elif max_drawdown < 10:
-            drawdown_score = 2
-        elif max_drawdown < 20:
-            drawdown_score = 4
-        elif max_drawdown < 30:
-            drawdown_score = 6
-        elif max_drawdown < 40:
-            drawdown_score = 8
-        else:
-            drawdown_score = 10
+        # 1. 回撤评分
+        if max_drawdown < 5:      drawdown_score = 1
+        elif max_drawdown < 10:   drawdown_score = 2
+        elif max_drawdown < 20:   drawdown_score = 4
+        elif max_drawdown < 30:   drawdown_score = 6
+        elif max_drawdown < 40:   drawdown_score = 8
+        else:                     drawdown_score = 10
 
         # 2. 基金类型风险基准分
         type_risk_map = {
@@ -184,40 +177,62 @@ def tool_calculate_risk_score(
         }
         type_score = type_risk_map.get(fund_type, 5)
 
-        # 3. 性价比分析（高风险低回报更危险）
-        # 🌰 冒了大风险却只赚了一点点 → 性价比极差
+        # 3. ✅ 新增：数据不足惩罚（次新基金的核心风险）
+        # 🌰 类比：面试一个只工作了3个月的人，表现再好也不能完全信任，样本太少
+        if actual_days < 180:
+            data_penalty = 3.0
+            data_warning = "⚠️ 严重：运行不足6个月，数据不具统计显著性，风险被严重低估"
+        elif actual_days < 365:
+            data_penalty = 2.0
+            data_warning = "⚠️ 警告：运行不足1年，历史数据参考价值有限"
+        elif actual_days < 730:
+            data_penalty = 1.0
+            data_warning = "注意：运行不足2年，未经历完整市场周期"
+        else:
+            data_penalty = 0.0
+            data_warning = ""
+
+        # 4. 性价比分析
         risk_return_ratio = return_rate / (max_drawdown + 1)
         if risk_return_ratio < 0.5:
-            performance_warning = "⚠️  风险收益比偏低，建议谨慎"
+            performance_warning = "⚠️ 风险收益比偏低"
         elif risk_return_ratio < 1.5:
             performance_warning = "📊 风险收益比一般"
         else:
-            performance_warning = "✅ 风险收益比较好"
+            performance_warning = "✅ 风险收益比表面较好（但需结合实际运行时长判断）"
 
-        # 综合评分（加权平均：回撤 60% + 类型 40%）
-        risk_score = round(drawdown_score * 0.6 + type_score * 0.4, 1)
+        # 5. 综合评分（加入数据惩罚项，最高不超过 10 分）
+        base_score  = round(drawdown_score * 0.6 + type_score * 0.4, 1)
+        final_score = min(10.0, round(base_score + data_penalty, 1))
 
-        # 风险等级描述
-        if risk_score <= 3:
-            level = "低风险"
-            advice = "适合保守型投资者，资金安全性较高"
-        elif risk_score <= 6:
-            level = "中等风险"
-            advice = "适合稳健型投资者，需要一定的风险承受能力"
-        elif risk_score <= 8:
-            level = "高风险"
-            advice = "适合积极型投资者，可能面临较大亏损"
+        # 6. 风险等级
+        if final_score <= 3:
+            level  = "低风险 🟢"
+            advice = "适合保守型投资者"
+        elif final_score <= 5:
+            level  = "中等风险 🟡"
+            advice = "适合稳健型投资者"
+        elif final_score <= 7:
+            level  = "中高风险 🟠"
+            advice = "适合积极型投资者，需有较强风险承受能力"
+        elif final_score <= 8:
+            level  = "高风险 🔴"
+            advice = "仅适合激进型投资者"
         else:
-            level = "极高风险"
-            advice = "仅适合激进型投资者，亏损概率极高"
+            level  = "极高风险 🔴🔴"
+            advice = "极度谨慎，建议回避"
 
         result = {
-            "risk_score": risk_score,
-            "risk_level": level,
-            "drawdown_impact": f"最大回撤{max_drawdown}%，回撤风险评分{drawdown_score}/10",
-            "type_impact": f"基金类型[{fund_type}]类型风险评分{type_score}/10",
+            "risk_score":           final_score,
+            "base_score":           base_score,
+            "data_penalty":         data_penalty,
+            "risk_level":           level,
+            "data_warning":         data_warning,
+            "drawdown_impact":      f"最大回撤{max_drawdown}%，回撤风险分{drawdown_score}/10",
+            "type_impact":          f"基金类型[{fund_type}]，类型基准分{type_score}/10",
+            "data_insufficiency":   f"运行{actual_days}天，数据不足惩罚+{data_penalty}分",
             "performance_analysis": performance_warning,
-            "investment_advice": advice
+            "investment_advice":    advice
         }
 
         return json.dumps(result, ensure_ascii=False, indent=2)

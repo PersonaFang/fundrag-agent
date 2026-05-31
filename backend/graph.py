@@ -19,6 +19,7 @@ LangGraph Multi-Agent 状态机（系统核心）
 """
 
 import os
+import json
 from datetime import datetime
 from typing import TypedDict, List, Annotated
 from dotenv import load_dotenv
@@ -70,6 +71,8 @@ class FundAnalysisState(TypedDict):
     fund_name: str               # 基金名称（行情分析完成后填入）
     fund_type: str               # 基金类型（行情分析完成后填入）
     user_query: str              # 用户的原始问题
+    actual_days: int             # 基金实际运行天数（行情节点提取后填入）
+    is_new_fund: bool            # 是否为次新基金（运行 < 365 天）
     market_analysis: str         # 行情分析师的分析结果
     sentiment_analysis: str      # 舆情研究员的分析结果
     risk_analysis: str           # 风险控制官的分析结果
@@ -204,12 +207,12 @@ def create_fund_analysis_graph():
         query = (
             f"请对基金代码 {state['fund_code']} 进行完整的行情分析。\n\n"
             f"用户问题：{state['user_query']}\n\n"
-            f"请依次调用工具：\n"
+            f"必须按顺序调用：\n"
             f"1. tool_get_fund_info 获取基本信息\n"
-            f"2. tool_get_fund_performance 获取近3年业绩数据\n"
-            f"3. tool_get_manager_info 获取基金经理信息（使用上一步得到的经理姓名）\n"
-            f"4. tool_compare_fund_ranking 获取同类排名（使用上一步得到的基金类型）\n\n"
-            f"最后综合输出行情分析报告。"
+            f"2. tool_get_fund_performance 获取业绩数据（注意读取返回的 actual_period_label 和 actual_days 字段）\n"
+            f"3. tool_get_manager_info（用步骤1返回的经理姓名，传入完整字符串）\n"
+            f"4. tool_compare_fund_ranking 获取同类排名\n\n"
+            f"输出报告时必须使用 actual_period_label 作为时间区间描述，禁止写「近3年」。"
         )
 
         try:
@@ -220,17 +223,37 @@ def create_fund_analysis_graph():
             )
             analysis = result["messages"][-1].content
             print(f"✅ [节点1] 行情分析完成，字数：{len(analysis)}")
+
+            # ✅ 从工具调用消息中提取 actual_days（解析 ToolMessage 的 JSON 内容）
+            actual_days = 0
+            is_new_fund = False
+            for msg in result.get("messages", []):
+                if hasattr(msg, "content") and isinstance(msg.content, str):
+                    try:
+                        data = json.loads(msg.content)
+                        if isinstance(data, dict) and "actual_days" in data:
+                            actual_days = int(data["actual_days"])
+                            is_new_fund = bool(data.get("is_new_fund", actual_days < 365))
+                            print(f"   [节点1] 提取到 actual_days={actual_days}, is_new_fund={is_new_fund}")
+                            break
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        pass
+
             return {
                 "market_analysis": analysis,
-                "current_step": "行情分析完成 ✅",
+                "actual_days":     actual_days,
+                "is_new_fund":     is_new_fund,
+                "current_step":    "行情分析完成 ✅",
             }
         except Exception as e:
             error_msg = f"行情分析失败：{str(e)}"
             print(f"❌ [节点1] {error_msg}")
             return {
                 "market_analysis": f"行情分析暂时不可用：{error_msg}",
-                "error_messages": state.get("error_messages", []) + [error_msg],
-                "current_step": "行情分析失败 ❌",
+                "actual_days":     0,
+                "is_new_fund":     False,
+                "error_messages":  state.get("error_messages", []) + [error_msg],
+                "current_step":    "行情分析失败 ❌",
             }
 
     def run_sentiment_analysis(state: FundAnalysisState) -> dict:
@@ -294,14 +317,18 @@ def create_fund_analysis_graph():
         print(f"\n{'='*50}")
         print(f"⚠️  [节点3] 风险控制官开始工作...")
 
+        actual_days = state.get("actual_days", 0)
+
         query = (
             f"请对基金代码 {state['fund_code']} 进行风险评估。\n\n"
+            f"已知该基金实际运行天数为 {actual_days} 天。\n\n"
             f"步骤（严格按顺序）：\n"
             f"1. 调用 tool_get_fund_performance 获取 max_drawdown_pct 和 total_return_pct\n"
-            f"2. 使用获取到的数值调用 tool_calculate_risk_score：\n"
-            f"   - max_drawdown = 获取到的最大回撤数值（浮点数，如 25.3）\n"
-            f"   - return_rate = 获取到的总收益率数值（浮点数，如 45.2）\n"
-            f"   - fund_type = 基金类型（如「股票型」「混合型」，从行情分析可知）\n"
+            f"2. 调用 tool_calculate_risk_score，参数：\n"
+            f"   - max_drawdown = 从步骤1获取的最大回撤数值（浮点数，如 25.3）\n"
+            f"   - return_rate  = 从步骤1获取的总收益率数值（浮点数，如 45.2）\n"
+            f"   - fund_type    = 基金类型（如「股票型」「混合型」）\n"
+            f"   - actual_days  = {actual_days}    ← 必须传入此值，不得省略\n"
             f"3. 综合输出多维度风险评估报告\n\n"
             f"参考行情分析结论：\n{state.get('market_analysis', '暂无')[:500]}"
         )
@@ -381,7 +408,24 @@ def create_fund_analysis_graph():
         print(f"\n{'='*50}")
         print(f"📝 [节点4] 报告撰写员开始汇总...")
 
-        data_quality_notice = state.get("data_quality", "数据质量未检测")
+        # ✅ 根据具体状态字段构建数据质量说明（比文本分析更准确）
+        actual_days = state.get("actual_days", 0)
+        is_new_fund = state.get("is_new_fund", False)
+        errors      = state.get("error_messages", [])
+
+        if is_new_fund:
+            data_quality_notice = (
+                f"⚠️ **次新基金警告**：该基金仅运行 {actual_days} 天，"
+                f"所有历史业绩、排名及风险指标均不具备统计显著性，"
+                f"请以官方基金公告为准，本报告分析结论参考价值有限。"
+            )
+        elif errors:
+            data_quality_notice = (
+                f"部分数据获取失败（{len(errors)}项），已使用模拟数据填充，"
+                f"相关指标仅供参考，请以官方渠道数据为准。"
+            )
+        else:
+            data_quality_notice = "✅ 本报告所有量化数据均来自 akshare 实时接口，数据可信。"
 
         synthesis_query = (
             f"请综合以下三份分析报告，生成最终的基金投研报告：\n\n"
@@ -393,11 +437,10 @@ def create_fund_analysis_graph():
             f"【风险评估报告】\n{state.get('risk_analysis', '数据获取失败')}\n\n"
             f"{'='*40}\n"
             f"基金代码：{state['fund_code']}\n"
+            f"基金实际运行天数：{actual_days}天（{'次新基金，禁止给出买入评级' if is_new_fund else '数据有效'}）\n"
             f"用户原始问题：{state['user_query']}\n\n"
-            f"⚠️ 数据质量说明（必须如实填入报告「七、数据质量说明」章节）：\n"
-            f"{data_quality_notice}\n\n"
-            f"请严格按照规定的 Markdown 格式输出完整的投研报告，"
-            f"将上方数据质量说明填入「{{data_quality_notice}}」占位符处。"
+            f"请将以下内容填入报告「七、数据质量说明」章节（直接替换 {{DATA_QUALITY_NOTICE}}）：\n"
+            f"{data_quality_notice}"
         )
 
         try:
@@ -407,16 +450,20 @@ def create_fund_analysis_graph():
                 config=config,
             )
             final_report = result["messages"][-1].content
+
+            # ✅ 兜底替换：防止 LLM 未替换占位符
+            final_report = final_report.replace("{DATA_QUALITY_NOTICE}", data_quality_notice)
+
             print(f"✅ [节点4] 报告生成完成，字数：{len(final_report)}")
             print(f"\n🎉 全部节点执行完毕！")
             return {
-                "final_report": final_report,
-                "current_step": "报告生成完成 🎉",
+                "final_report":  final_report,
+                "data_quality":  data_quality_notice,
+                "current_step":  "报告生成完成 🎉",
             }
         except Exception as e:
             error_msg = f"报告生成失败：{str(e)}"
             print(f"❌ [节点4] {error_msg}")
-            # 报告生成失败时，用三份子报告拼接作为兜底
             fallback_report = (
                 f"# 📋 基金分析报告（自动降级版）\n\n"
                 f"> 报告生成失败，以下为各子模块原始输出\n\n"
@@ -425,9 +472,9 @@ def create_fund_analysis_graph():
                 f"## 风险评估\n{state.get('risk_analysis', '无数据')}\n"
             )
             return {
-                "final_report": fallback_report,
+                "final_report":   fallback_report,
                 "error_messages": state.get("error_messages", []) + [error_msg],
-                "current_step": "报告生成失败（已降级）❌",
+                "current_step":   "报告生成失败（已降级）❌",
             }
 
     # ---- 构建状态图 ----
@@ -481,17 +528,19 @@ def run_fund_analysis(fund_code: str, user_query: str, session_id: str = "defaul
 
     # 初始化状态，所有字段必须赋值（TypedDict 要求）
     initial_state: FundAnalysisState = {
-        "fund_code": fund_code.strip(),
-        "fund_name": fund_code.strip(),   # 分析过程中会自动更新为真实名称
-        "fund_type": "混合型",             # 分析过程中会自动更新
-        "user_query": user_query,
-        "market_analysis": "",
+        "fund_code":         fund_code.strip(),
+        "fund_name":         fund_code.strip(),   # 分析过程中会自动更新为真实名称
+        "fund_type":         "混合型",             # 分析过程中会自动更新
+        "user_query":        user_query,
+        "actual_days":       0,                   # 行情节点执行后填入
+        "is_new_fund":       False,               # 行情节点执行后填入
+        "market_analysis":   "",
         "sentiment_analysis": "",
-        "risk_analysis": "",
-        "final_report": "",
-        "data_quality": "",
-        "error_messages": [],
-        "current_step": "开始分析...",
+        "risk_analysis":     "",
+        "final_report":      "",
+        "data_quality":      "",
+        "error_messages":    [],
+        "current_step":      "开始分析...",
     }
 
     print(f"\n{'#'*50}")
