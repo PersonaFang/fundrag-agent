@@ -126,38 +126,41 @@ def render_agent_status_table(statuses: dict) -> None:
 
 def render_data_quality_badge(result: dict) -> None:
     """
-    V2.1：根据数据质量等级显示彩色 Badge（修复文案 + 增加矛盾详情）
+    V2.1：根据数据质量等级显示彩色 Badge
+    ✅ 文案完全硬编码，不含任何 LLM 生成内容（防止"丰田结论"等幻觉词混入）
     """
     quality_json = result.get("data_quality_json", "")
     if not quality_json:
-        st.warning("数据质量信息未生成")
+        st.warning("⬜ 数据质量信息未生成")
         return
 
     try:
         import json
-        q = json.loads(quality_json)
+        q          = json.loads(quality_json)
         level      = q.get("level", "unknown")
-        mock_count = q.get("mock_metric_count", 0)
+        mock_count = int(q.get("mock_metric_count", 0))
         contras    = q.get("contradictions", [])
 
+        # ✅ 全部硬编码，绝无 LLM 生成内容
         if level == "real":
             st.success("🟢 数据完整｜核心指标均来自真实接口")
         elif level == "partial":
             st.warning(
                 f"🟡 部分模拟｜{mock_count} 项指标为模拟数据，"
-                "不输出正式评级（适配结论显示为「信息不足」）"
+                "适配结论为「信息不足」，不输出正式评级"
             )
         elif level == "failed":
             st.error(
-                f"🔴 数据矛盾｜检测到 {len(contras)} 处不一致，已停止评级生成"
+                f"🔴 数据矛盾｜检测到 {len(contras)} 处不一致，"
+                "适配结论为「无法评级」"
             )
             for c in contras[:3]:
                 st.caption(f"  ⛔ {c}")
         else:
-            st.error("🔴 全部模拟｜数据不具参考价值")
+            st.error("🔴 数据不可用｜无法生成有效分析")
 
     except Exception as e:
-        st.caption(f"Badge 加载失败：{e}")
+        st.warning(f"⬜ 数据质量 Badge 加载失败：{e}")
 
 
 def render_score_section(result: dict) -> None:
@@ -201,9 +204,7 @@ def render_score_section(result: dict) -> None:
         if cap_reason:
             st.warning(f"⚠️ 评级限制：{cap_reason}")
 
-        suitability = score.get("suitability", "")
-        if suitability:
-            st.info(f"👥 适合人群：{suitability}")
+        # ✅ 不再显示 suitability（报告模板第四章节已有，避免重复）
 
     except Exception as e:
         st.caption(f"评分展示异常：{e}")

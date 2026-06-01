@@ -95,6 +95,7 @@ class FundSnapshot(BaseModel):
 
     # Benchmark（P3 新增）
     benchmark_name:          Optional[str] = None
+    benchmark:               Optional[Any] = None    # V2.1新增：BenchmarkInfo 对象（benchmark_resolver）
     benchmark_return_pct:    Optional[MetricSource] = None
     alpha_pct:               Optional[MetricSource] = None  # 超额收益
 

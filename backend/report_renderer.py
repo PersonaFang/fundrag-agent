@@ -72,59 +72,108 @@ def fmt_nature_badge(metric) -> str:
 
 
 def fmt_source(metric) -> str:
-    """返回数据来源，确保不出现脏值"""
+    """返回数据来源，确保不出现脏值。本地兜底优先，不依赖外部函数抛异常"""
     if metric is None:
         return "—"
 
-    from backend.value_cleaner import normalize_source
+    src = getattr(metric, 'source', None) or 'missing'
+
+    # 本地优先清洗脏值（不依赖 normalize_source 抛异常）
+    _DIRTY_SOURCE_FIX = {
+        "嘲笑": "mock",
+        "计算": "calculated",
+        "模拟": "mock",
+        "真实": "akshare",
+        "akShare": "akshare",
+    }
+    if src in _DIRTY_SOURCE_FIX:
+        return _DIRTY_SOURCE_FIX[src]
+
+    _ALLOWED = {"akshare", "tavily", "calculated", "official", "missing", "mock"}
+    if src in _ALLOWED:
+        return src
+
+    # 最终兜底：调用 normalize_source
     try:
-        src = getattr(metric, 'source', 'missing') or 'missing'
-        return normalize_source(src, allow_warning=False)
+        from backend.value_cleaner import normalize_source
+        return normalize_source(src, allow_warning=True)
     except ValueError:
-        return "来源异常"
+        return "来源未知"
+
+
+def add_row_fixed(label: str, metric, suffix: str = "") -> str:
+    """
+    构建单行指标表格行（可独立导入）
+    ✅ metric=None 时返回「数据缺失」，不是「数据援助」
+    ✅ 来源列通过 fmt_source 清洗（嘲笑→mock）
+    """
+    if metric is None or getattr(metric, 'value', None) is None:
+        return f"| {label} | 数据缺失 | ⬜ 缺失 | — | — |"
+
+    val = metric.value
+    if isinstance(val, float):
+        val_str = f"{val:.4f}" if abs(val) < 10 else f"{val:.2f}"
+    else:
+        val_str = str(val)
+    val_str += suffix
+
+    nature  = getattr(metric, 'nature', None)
+    is_mock = getattr(metric, 'is_mock', False)
+    n_str   = (nature.value if hasattr(nature, 'value') else str(nature)) if nature else ""
+
+    if n_str == 'missing':
+        return f"| {label} | 数据缺失 | ⬜ 缺失 | — | — |"
+    elif n_str == 'mock' or is_mock:
+        val_str += "（⚠️ 模拟，不参与评分）"
+        badge = "🔴 模拟"
+    elif n_str == 'suspicious':
+        val_str += "（⚠️ 口径存疑）"
+        badge = "🟡 存疑"
+    else:
+        badge = "✅ 真实"
+
+    as_of = str(metric.as_of) if getattr(metric, 'as_of', None) else "—"
+    src   = fmt_source(metric)
+    return f"| {label} | {val_str} | {badge} | {as_of} | {src} |"
 
 
 def render_metric_table(snapshot) -> str:
     """
     渲染核心指标溯源表
     ✅ 列名修复：现有日期 → 截止日期
-    ✅ 空值修复：数据援助 → 数据缺失
-    ✅ 来源修复：嘲笑 → mock（模拟）
+    ✅ 空值修复：数据援助 → 数据缺失（通过 add_row_fixed）
+    ✅ 来源修复：嘲笑 → mock（通过 fmt_source）
     """
     rows = [
         "| 指标 | 数值 | 数据性质 | 截止日期 | 来源 |",
         "|------|------|---------|---------|------|",
     ]
 
-    def add_row(label: str, metric, suffix: str = ""):
-        val   = fmt_metric_value(metric, suffix)
-        badge = fmt_nature_badge(metric)
-        src   = fmt_source(metric)
-        as_of = "—"
-        if metric and getattr(metric, 'as_of', None):
-            as_of = str(metric.as_of)
-        rows.append(f"| {label} | {val} | {badge} | {as_of} | {src} |")
-
-    # 兼容新旧 schema 的字段名
-    add_row("最新净值",
-            getattr(snapshot, 'unit_nav', None) or getattr(snapshot, 'nav', None),
-            " 元")
-    add_row("累计净值",       getattr(snapshot, 'accumulated_nav', None), " 元")
-    add_row("基金规模",
-            getattr(snapshot, 'fund_size', None) or getattr(snapshot, 'fund_size_bn', None),
-            " 亿元")
-    add_row("自成立以来收益",  getattr(snapshot, 'return_since_inception', None), "%")
-    add_row("近 1 年收益",    getattr(snapshot, 'return_1y', None), "%")
-    add_row("近 3 年收益",    getattr(snapshot, 'return_3y', None), "%")
-    add_row("最大回撤",
-            getattr(snapshot, 'max_drawdown', None) or getattr(snapshot, 'max_drawdown_pct', None),
-            "%")
-    add_row("基准收益（同期）",
-            getattr(snapshot, 'benchmark_return', None) or getattr(snapshot, 'benchmark_return_pct', None),
-            "%")
-    add_row("超额收益（Alpha）",
-            getattr(snapshot, 'alpha', None) or getattr(snapshot, 'alpha_pct', None),
-            "%")
+    rows.append(add_row_fixed(
+        "最新净值",
+        getattr(snapshot, 'unit_nav', None) or getattr(snapshot, 'nav', None),
+        " 元"
+    ))
+    rows.append(add_row_fixed("累计净值",
+        getattr(snapshot, 'accumulated_nav', None), " 元"))
+    rows.append(add_row_fixed("基金规模",
+        getattr(snapshot, 'fund_size', None) or getattr(snapshot, 'fund_size_bn', None),
+        " 亿元"))
+    rows.append(add_row_fixed("自成立以来收益",
+        getattr(snapshot, 'return_since_inception', None), "%"))
+    rows.append(add_row_fixed("近 1 年收益",
+        getattr(snapshot, 'return_1y', None), "%"))
+    rows.append(add_row_fixed("近 3 年收益",
+        getattr(snapshot, 'return_3y', None), "%"))
+    rows.append(add_row_fixed("最大回撤",
+        getattr(snapshot, 'max_drawdown', None) or getattr(snapshot, 'max_drawdown_pct', None),
+        "%"))
+    rows.append(add_row_fixed("基准收益（同期）",
+        getattr(snapshot, 'benchmark_return', None) or getattr(snapshot, 'benchmark_return_pct', None),
+        "%"))
+    rows.append(add_row_fixed("超额收益（Alpha）",
+        getattr(snapshot, 'alpha', None) or getattr(snapshot, 'alpha_pct', None),
+        "%"))
 
     return "\n".join(rows)
 
@@ -246,6 +295,33 @@ def render_managers_text(snapshot) -> str:
     return "、".join(parts)
 
 
+def _clean_commentary(text: str) -> str:
+    """
+    清洗 LLM commentary 文本：
+    1. 去除 LLM 可能生成的「📌方案/理念/概念/建议/丰田结论：...」段落（防止覆写模板标题）
+    2. 去除 LLM 生成的 ## 综合评分 / ## 评级 章节（已由模板控制）
+    3. 应用 AUTO_FIX_MAP 修复常见幻觉词
+    """
+    if not text:
+        return "数据获取失败，请重试。"
+
+    import re
+    from backend.value_cleaner import auto_fix_text
+
+    # 删除 LLM 生成的结论/评级段落（这些应由模板控制，LLM不得重复生成）
+    _STRIP_PATTERNS = [
+        re.compile(r'(?:📌|##\s*)(?:方案|理念|概念|建议|适配|综合|投资|丰田)\s*结论[：:][^\n]*\n?', re.M),
+        re.compile(r'(?:##\s*)(?:综合评分|评级)[^\n]*\n?', re.M),
+        re.compile(r'评级[：:]\s*(?:风险较高|适合配置|谨慎关注|持续观察|信息不足|无法评级)\s*\n?', re.M),
+    ]
+    for pattern in _STRIP_PATTERNS:
+        text = pattern.sub('', text)
+
+    # 应用 AUTO_FIX_MAP 修复
+    fixed, _ = auto_fix_text(text)
+    return fixed.strip()
+
+
 # Backward-compat alias
 def render_data_quality_section(quality) -> str:
     """兼容旧接口"""
@@ -352,19 +428,19 @@ def render_report(
 
 ## 五、行情分析
 
-{market_commentary or "行情分析数据获取失败，请重试。"}
+{_clean_commentary(market_commentary)}
 
 ---
 
 ## 六、舆情分析
 
-{sentiment_commentary or "舆情分析数据获取失败，请重试。"}
+{_clean_commentary(sentiment_commentary)}
 
 ---
 
 ## 七、风险评估
 
-{risk_commentary or "风险评估数据获取失败，请重试。"}
+{_clean_commentary(risk_commentary)}
 
 ---
 

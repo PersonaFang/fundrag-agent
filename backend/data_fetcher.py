@@ -505,6 +505,11 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
     拉取所有数据并构建 FundSnapshot 对象
     这是 V2.0 graph 的唯一数据入口
 
+    V2.1 修复：
+    - 累计净值从「累计净值走势」接口单独获取，不写死1.0
+    - 调用 benchmark_resolver 解析基准指数
+    - MetricSource source 字段统一用英文
+
     🌰 类比：「采购员」把所有食材买齐、整理好放进冰箱，
              后续所有厨师从同一个冰箱取材
     """
@@ -515,6 +520,16 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
 
     if report_date is None:
         report_date = date_type.today()
+
+    # ---- 安全构建 MetricSource 的辅助函数（统一清洗 source 字段）----
+    def safe_metric_source(value, unit, source, **kwargs):
+        """构建 MetricSource 时强制清洗 source 字段为合法英文值"""
+        from backend.value_cleaner import normalize_source
+        try:
+            clean_src = normalize_source(source, allow_warning=True)
+        except ValueError:
+            clean_src = "mock"
+        return MetricSource(value=value, unit=unit, source=clean_src, **kwargs)
 
     # 1. 基本信息
     basic = get_fund_basic_info(code)
@@ -623,7 +638,39 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
             percentile=round(int(rank_pos) / int(total_funds) * 100, 2),
         )
 
-    # 5. 基准对比（P3）
+    # 5. 累计净值（V2.1修复：独立接口获取，不写死1.0）
+    accumulated_nav_metric = None
+    if AKSHARE_AVAILABLE:
+        try:
+            acc_df = ak.fund_open_fund_info_em(symbol=code, indicator="累计净值走势")
+            if acc_df is not None and not acc_df.empty:
+                acc_col  = next(
+                    (c for c in ["累计净值", "净值"] if c in acc_df.columns),
+                    acc_df.columns[1]
+                )
+                date_col = next(
+                    (c for c in ["净值日期", "日期"] if c in acc_df.columns),
+                    acc_df.columns[0]
+                )
+                acc_df[date_col] = pd.to_datetime(acc_df[date_col])
+                acc_df = acc_df.sort_values(date_col)
+                latest_acc      = float(acc_df[acc_col].iloc[-1])
+                latest_acc_date = acc_df[date_col].iloc[-1].date()
+                accumulated_nav_metric = MetricSource(
+                    value=latest_acc,
+                    unit="元",
+                    source="akshare",
+                    endpoint="fund_open_fund_info_em(累计净值走势)",
+                    as_of=latest_acc_date,
+                    is_mock=False,
+                    confidence=1.0,
+                )
+                print(f"✅ 累计净值获取成功：{code} = {latest_acc}")
+        except Exception as e:
+            print(f"⚠️ 累计净值获取失败，不写死1.0，显示为数据缺失：{e}")
+            # 不写死 accumulated_nav_metric = None（保持 None，避免写入错误值）
+
+    # 6. 基准对比（P3）
     benchmark_return_metric = None
     alpha_metric = None
     benchmark_name = None
@@ -650,7 +697,26 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
         except Exception as e:
             print(f"⚠️ 基准数据计算失败（不影响主流程）：{e}")
 
-    # 6. 构建 FundSnapshot
+    # 7. 基准指数解析（V2.1新增：benchmark_resolver）
+    fund_name_for_bench = basic.get("name", code)
+    declared_benchmark  = basic.get("业绩比较基准") or basic.get("跟踪标的") or None
+    try:
+        from backend.benchmark_resolver import resolve_benchmark
+        benchmark_info = resolve_benchmark(
+            fund_name=fund_name_for_bench,
+            fund_type=fund_type,
+            declared_benchmark=declared_benchmark,
+        )
+        # 如果 benchmark_resolver 解析到了名称，优先用它覆盖旧的 benchmark_name
+        if benchmark_info and benchmark_info.name:
+            benchmark_name = benchmark_info.name
+        print(f"✅ benchmark_resolver: {getattr(benchmark_info, 'name', None)} "
+              f"matched={getattr(benchmark_info, 'is_matched', False)}")
+    except Exception as e:
+        print(f"⚠️ benchmark_resolver 失败（不影响主流程）：{e}")
+        benchmark_info = None
+
+    # 8. 构建 FundSnapshot
     snapshot = FundSnapshot(
         code=code,
         report_date=report_date,
@@ -663,10 +729,8 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
             as_of=last_nav_date, is_mock=is_mock_perf,
             endpoint="fund_open_fund_info_em"
         ) if nav_val is not None else None,
-        accumulated_nav=MetricSource(
-            value=first_nav_val, unit="元", source="akshare" if not is_mock_perf else "mock",
-            as_of=last_nav_date, is_mock=is_mock_perf,
-        ) if first_nav_val is not None else None,
+        # ✅ V2.1修复：使用真实接口的累计净值（非first_nav，非写死1.0）
+        accumulated_nav=accumulated_nav_metric,
         fund_size_bn=MetricSource(
             value=fund_size_val, unit="亿元",
             source="akshare" if not is_mock_basic else "mock",
@@ -685,7 +749,8 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
         ) if max_drawdown is not None else None,
         peer_rank=peer_rank,
         managers=managers,
-        benchmark_name=benchmark_name,
+        benchmark_name=benchmark_name,          # 保留字符串字段兼容旧代码
+        benchmark=benchmark_info,               # ✅ V2.1新增：BenchmarkInfo对象
         benchmark_return_pct=benchmark_return_metric,
         alpha_pct=alpha_metric,
         raw={

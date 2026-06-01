@@ -140,6 +140,24 @@ def check_unreplaced_placeholders(text: str) -> list[str]:
 
 
 # ============================================================
+# 8. 结论标题变体检测（V2.1 新增）
+# ============================================================
+def check_heading_variants(text: str) -> list[str]:
+    """
+    检测「📌适配结论」heading 被 LLM 替换为其他词的情况
+    合法：「📌 适配结论：...」
+    非法：「📌方案结论」「📌理念结论」「📌概念结论」「📌建议结论」「📌丰田结论」
+    """
+    errors = []
+    bad_heading_pattern = re.compile(
+        r'📌\s*(方案|理念|概念|建议|综合|投资|丰田)\s*结论'
+    )
+    for m in bad_heading_pattern.finditer(text):
+        errors.append(f"非法结论标题：「{m.group(0).strip()}」，应为「📌 适配结论」")
+    return errors
+
+
+# ============================================================
 # 主校验函数
 # ============================================================
 def validate_report(text: str) -> tuple[bool, list[str]]:
@@ -158,6 +176,7 @@ def validate_report(text: str) -> tuple[bool, list[str]]:
     errors.extend(check_mock_score_conflict(text))
     errors.extend(check_broken_phrases(text))
     errors.extend(check_duplicate_sections(text))
+    errors.extend(check_heading_variants(text))
 
     placeholders = check_unreplaced_placeholders(text)
     if placeholders:
