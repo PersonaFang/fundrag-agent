@@ -309,17 +309,27 @@ def score_fund(
 
     # ============ 路径3：次新基金 ============
     if run_days < 365:
+        # ✅ V1.7 修复：次新基金风险等级用 compute_risk_level()，不能只看短期回撤
+        fund_name_v = getattr(snapshot, 'name', '') or ''
+        fund_type_v = getattr(snapshot, 'fund_type', '') or ''
+        risk_level_final = compute_risk_level(
+            max_drawdown_pct=mdd_val,
+            fund_name=fund_name_v,
+            fund_type=fund_type_v,
+            run_days=run_days,
+        )
         return ScoreResult(
             history_score=compute_history_score(snapshot, run_days),
             sentiment_score=round(max(0, min(sentiment_score, 10)), 1),
             risk_control_score=risk_ctrl_score,
-            alpha_adjustment=0.0,
-            total_score=None,    # ✅ 次新基金不输出综合分
+            alpha_adjustment=None,   # ✅ V1.7 修复：次新基金 Alpha 强制 None
+            total_score=None,        # ✅ 次新基金不输出综合分
             rating="持续观察",
             confidence_label="低",
-            risk_level=risk_level,
+            risk_level=risk_level_final,   # ✅ 使用综合风险等级
             rating_cap_reason=f"运行仅 {run_days} 天（< 1年），评级上限为持续观察",
             suitability=SUITABILITY_MAP["持续观察"],
+            run_days=run_days,
         )
 
     # ============ 路径4：正常计算 ============

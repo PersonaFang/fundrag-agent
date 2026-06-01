@@ -61,36 +61,6 @@ def normalize_source(source: str | None, allow_warning: bool = True) -> str:
     return source
 
 
-def normalize_rating(rating: str | None) -> str:
-    """
-    校验评级合法性，非法评级返回"无法评级"
-    """
-    if not rating:
-        return "无法评级"
-
-    rating = rating.strip()
-
-    # 自动修复已知的非法评级
-    illegal_to_valid = {
-        "吞":   "无法评级",
-        "缓解": "风险较高",
-        "建议买入": "谨慎关注",
-        "建议卖出": "风险较高",
-        "强烈推荐": "谨慎关注",
-        "中性持有": "谨慎关注",
-    }
-    if rating in illegal_to_valid:
-        mapped = illegal_to_valid[rating]
-        print(f"⚠️ 非法评级自动修复：'{rating}' → '{mapped}'")
-        return mapped
-
-    if rating not in ALLOWED_RATINGS:
-        print(f"⚠️ 未知评级 '{rating}'，返回 '无法评级'")
-        return "无法评级"
-
-    return rating
-
-
 def clean_manager_name(raw: str | None) -> list[str]:
     """
     清洗基金经理姓名字段
@@ -123,24 +93,111 @@ def clean_manager_name(raw: str | None) -> list[str]:
 
 def auto_fix_text(text: str) -> tuple[str, list[str]]:
     """
-    对报告文本执行自动修复
+    对报告文本执行自动修复。
+    Step1: 应用 AUTO_FIX_MAP
+    Step2: 独立正则修复（不依赖 AUTO_FIX_MAP 完整性）
     返回 (修复后文本, 修复记录列表)
     """
+    import re
     fixes = []
+
+    # Step1: 应用 AUTO_FIX_MAP
     for wrong, correct in AUTO_FIX_MAP.items():
         if wrong in text:
             text = text.replace(wrong, correct)
             fixes.append(f"'{wrong}' → '{correct}'")
+
+    # Step2: 独立正则修复
+    # 修复"显着"→"显著"（避免误替换"显着重"）
+    new = re.sub(r'显着(?!重)', '显著', text)
+    if new != text:
+        fixes.append("'显着' → '显著'")
+        text = new
+
+    # 修复"阿尔法"→"Alpha"
+    new = text.replace("阿尔法调整", "Alpha 调整").replace("阿尔法", "Alpha")
+    if new != text:
+        fixes.append("'阿尔法' → 'Alpha'")
+        text = new
+
+    # 修复非法结论标题
+    new = re.sub(
+        r'📌\s*(方案|理念|概念|建议|综合|投资|丰田|修正|改进)\s*结论',
+        '📌 适配结论',
+        text
+    )
+    if new != text:
+        fixes.append("非法结论标题 → '📌 适配结论'")
+        text = new
+
+    # 修复 Banner 语序
+    new = text.replace("约束已。", "约束。").replace(
+        "修正结论受运行时长约束已", "适配结论已受运行时长约束"
+    )
+    if new != text:
+        fixes.append("Banner 语序修正")
+        text = new
+
     return text, fixes
+
+
+def normalize_rating(rating: str | None) -> str:
+    """
+    校验评级合法性，非法评级返回"无法评级"
+    ✅ V1.7 扩展：覆盖"建议结论"/"修正结论"等变体
+    """
+    if not rating:
+        return "无法评级"
+
+    rating = rating.strip().strip('*「」【】"\'')
+
+    if rating in ALLOWED_RATINGS:
+        return rating
+
+    # 扩展变体映射
+    _VARIANTS = {
+        "吞":          "无法评级",
+        "缓解":        "风险较高",
+        "建议买入":    "谨慎关注",
+        "建议卖出":    "风险较高",
+        "强烈推荐":    "谨慎关注",
+        "中性持有":    "谨慎关注",
+        # 常见近义词
+        "建议配置":    "适合配置",
+        "可以配置":    "适合配置",
+        "谨慎":        "谨慎关注",
+        "观察":        "持续观察",
+        "数据不足":    "信息不足",
+        "高风险":      "风险较高",
+        # 非法标题变体（出现在评级字段里）
+        "建议结论":    "无法评级",
+        "修正结论":    "无法评级",
+        "理念结论":    "无法评级",
+        "概念结论":    "无法评级",
+        "丰田结论":    "无法评级",
+    }
+
+    for key, val in _VARIANTS.items():
+        if key in rating:
+            print(f"⚠️ 非法评级自动修复：'{rating}' → '{val}'")
+            return val
+
+    print(f"⚠️ 未知评级 '{rating}'，返回 '无法评级'")
+    return "无法评级"
 
 
 def scan_banned_words(text: str) -> list[str]:
     """
-    扫描文本中的禁用词
+    扫描文本中的禁用词。
+    ✅ V1.7：新增「显着」错别字检测
     返回找到的禁用词列表
     """
+    import re
     found = []
     for word in BANNED_WORDS:
         if word in text:
             found.append(word)
+    # 额外检测「显着」错别字
+    if re.search(r'显着(?!重)', text):
+        found.append("显着（错别字）")
     return found

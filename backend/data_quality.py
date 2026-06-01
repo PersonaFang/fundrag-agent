@@ -102,11 +102,14 @@ def validate_snapshot(snapshot: FundSnapshot) -> DataQualityReport:
         level = DataQualityLevel.FAILED
     elif mock_count > 0 or missing:
         level = DataQualityLevel.PARTIAL
+    elif snapshot.run_days is not None and snapshot.run_days < 365:
+        # ✅ V2.2/V1.7 修复：次新基金数据来源真实但样本不足 → LIMITED
+        level = DataQualityLevel.LIMITED
     else:
         level = DataQualityLevel.REAL
 
     can_generate_rating = (
-        level in [DataQualityLevel.REAL, DataQualityLevel.PARTIAL]
+        level in [DataQualityLevel.REAL, DataQualityLevel.LIMITED, DataQualityLevel.PARTIAL]
         and not contradictions
         and "inception_date" not in missing
     )
@@ -120,6 +123,7 @@ def validate_snapshot(snapshot: FundSnapshot) -> DataQualityReport:
         warnings=warnings,
         can_generate_rating=can_generate_rating,
         can_generate_report=(level != DataQualityLevel.FAILED),
+        run_days=snapshot.run_days,   # ✅ V2.2 新增：传递给渲染层
     )
 
 

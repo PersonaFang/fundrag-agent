@@ -11,19 +11,43 @@ from pydantic import BaseModel, Field, field_validator
 
 
 class DataQualityLevel(str, Enum):
-    REAL    = "real"      # 全部真实数据
-    PARTIAL = "partial"   # 部分模拟或缺失
-    MOCK    = "mock"      # 全部模拟
-    FAILED  = "failed"    # 数据存在硬性矛盾
+    REAL        = "real"        # 全部真实数据
+    LIMITED     = "limited"     # V2.2 新增：次新基金，数据真实但样本不足
+    PARTIAL     = "partial"     # 部分模拟或缺失
+    MOCK        = "mock"        # 全部模拟
+    FAILED      = "failed"      # 数据存在硬性矛盾
+    UNAVAILABLE = "unavailable" # 数据严重不足
 
 
 class DataNature(str, Enum):
-    """单个指标的数据性质（V2.1 新增）"""
+    """单个指标的数据性质（V2.1+）"""
     REAL        = "real"        # 来自可信外部接口的真实数据
     CALCULATED  = "calculated"  # 由 real 数据计算得出
     MISSING     = "missing"     # 缺失，无法获取
     MOCK        = "mock"        # 模拟/降级数据
     SUSPICIOUS  = "suspicious"  # 数据存在疑问
+
+    @classmethod
+    def from_any(cls, val) -> "DataNature":
+        """
+        安全转换：支持英文值、中文旧值、枚举实例。
+        ✅ 任何未知值（含"阿富汗"）→ MISSING，绝不抛异常
+        """
+        if val is None:
+            return cls.MISSING
+        if isinstance(val, cls):
+            return val
+        _LEGACY = {
+            "真实": cls.REAL, "计算": cls.CALCULATED,
+            "缺失": cls.MISSING, "模拟": cls.MOCK, "存疑": cls.SUSPICIOUS,
+        }
+        _BY_VALUE = {v.value: v for v in cls}
+        key = str(val).strip()
+        if key in _BY_VALUE:
+            return _BY_VALUE[key]
+        if key in _LEGACY:
+            return _LEGACY[key]
+        return cls.MISSING   # 兜底
 
 
 class MetricSource(BaseModel):
@@ -39,6 +63,32 @@ class MetricSource(BaseModel):
     note:       Optional[str] = None
     nature:     Optional[DataNature] = None   # V2.1：数据性质
     depends_on: list[str] = Field(default_factory=list)  # V2.1：依赖字段名
+
+    @field_validator('nature', mode='before')
+    @classmethod
+    def _validate_nature(cls, v):
+        """✅ 任何脏值（含"阿富汗"）→ DataNature.MISSING"""
+        if v is None:
+            return None
+        return DataNature.from_any(v)
+
+    @field_validator('source', mode='before')
+    @classmethod
+    def _validate_source(cls, v):
+        """清洗脏 source 值"""
+        if v is None:
+            return "missing"
+        _FIX = {"嘲笑": "mock", "计算": "calculated", "模拟": "mock", "真实": "akshare"}
+        _OK  = {"akshare","tavily","calculated","official","missing","mock","unknown"}
+        s = str(v).strip()
+        return _FIX.get(s, s if s in _OK else "unknown")
+
+    @property
+    def safe_nature_key(self) -> str:
+        """返回安全的 nature key，可直接用于 _NATURE_DISPLAY 查找"""
+        if self.nature is None:
+            return "missing"
+        return self.nature.value if hasattr(self.nature, 'value') else "missing"
 
 
 class PeerRank(BaseModel):
@@ -101,6 +151,9 @@ class FundSnapshot(BaseModel):
 
     raw: dict[str, Any] = Field(default_factory=dict)
 
+    # 持仓分析（Module 1：前十大重仓股）
+    holdings_json: Optional[str] = None    # HoldingsAnalysis.to_json()
+
 
 class DataQualityReport(BaseModel):
     level:               DataQualityLevel
@@ -112,6 +165,7 @@ class DataQualityReport(BaseModel):
     warnings:            list[str] = []
     can_generate_rating: bool = False
     can_generate_report: bool = True
+    run_days:            Optional[int] = None   # V2.2 新增：传递给渲染层
 
 
 class ScoreBreakdown(BaseModel):

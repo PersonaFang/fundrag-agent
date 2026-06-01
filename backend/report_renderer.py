@@ -52,18 +52,38 @@ _ALLOWED_SOURCES = {
 def _safe_nature_display(metric) -> str:
     """
     安全将 MetricSource.nature 转换为显示文本。
-    ✅ 任何非法值（含"阿富汗"等） → "⬜ 缺失"，绝不透传
+    ✅ 三层防御：
+      1. is_mock → 🔴 模拟
+      2. safe_nature_key 在 _NATURE_DISPLAY 中 → 正常返回
+      3. 任何其他值（含"阿富汗"/"真实"等历史脏值）→ "⬜ 缺失"
     """
     if metric is None:
         return "⬜ 缺失"
     is_mock = getattr(metric, 'is_mock', False)
     if is_mock:
         return "🔴 模拟"
+
     nature = getattr(metric, 'nature', None)
     if nature is None:
         return "⬜ 缺失"
-    key = nature.value if hasattr(nature, 'value') else str(nature)
-    return _NATURE_DISPLAY.get(key, "⬜ 缺失")  # ✅ 兜底 "⬜ 缺失"
+
+    # 优先使用 safe_nature_key 属性（MetricSource V2.2 有此属性）
+    if hasattr(metric, 'safe_nature_key'):
+        key = metric.safe_nature_key
+    else:
+        key = nature.value if hasattr(nature, 'value') else str(nature)
+
+    # 主查表
+    result = _NATURE_DISPLAY.get(key)
+    if result is not None:
+        return result
+
+    # 中文旧值兼容
+    _LEGACY = {
+        "真实": "✅ 真实", "计算": "✅ 计算",
+        "模拟": "🔴 模拟", "缺失": "⬜ 缺失", "存疑": "🟡 存疑",
+    }
+    return _LEGACY.get(key, "⬜ 缺失")  # ✅ 终极兜底
 
 
 def _safe_value_display(metric, suffix: str = "") -> str:
@@ -379,6 +399,19 @@ def _clean_commentary(text: str) -> str:
 # 最终报告渲染
 # ============================================================
 
+def _build_new_fund_banner(run_days: int) -> str:
+    """
+    次新基金警告 Banner，语序硬编码，不经过 LLM。
+    ✅ 正确：「适配结论已受运行时长约束」
+    ✅ 不出现「约束已」「修正结论」等历史污染词
+    """
+    return (
+        f"\n> ⚠️ **次新基金警告**：该基金运行仅 **{run_days} 天**，"
+        "所有历史业绩与风险指标统计意义有限，"
+        "适配结论已受运行时长约束。\n"
+    )
+
+
 def render_report(
     snapshot,
     quality,
@@ -386,6 +419,7 @@ def render_report(
     market_commentary:    str,
     sentiment_commentary: str,
     risk_commentary:      str,
+    periodic_report_json: str = "",   # Module 3: 定期报告经理观点
 ) -> str:
     """
     最终报告模板 V2.2。
@@ -410,14 +444,10 @@ def render_report(
         bench_name = getattr(snapshot, 'benchmark_name', None)
     report_date  = getattr(snapshot, 'report_date', str(date_type.today()))
 
-    # ✅ 语序正确，不出现"约束已"
+    # ✅ 使用硬编码函数生成 Banner，语序安全
     new_fund_banner = ""
     if run_days and run_days < 365:
-        new_fund_banner = (
-            f"\n> ⚠️ **次新基金警告**：该基金运行仅 **{run_days} 天**，"
-            "所有历史业绩与风险指标统计意义有限，"
-            "适配结论已受运行时长约束。\n"
-        )
+        new_fund_banner = _build_new_fund_banner(run_days)
 
     bench_warn = ""
     bench_mismatch = getattr(benchmark, 'mismatch_warning', None) if benchmark else None
@@ -434,6 +464,40 @@ def render_report(
     bench_display = bench_name if bench_name else "数据缺失"
 
     managers_text = _render_managers(snapshot)
+
+    # Module 1: 持仓分析章节
+    holdings_section = ""
+    holdings_json_str = getattr(snapshot, 'holdings_json', None)
+    if holdings_json_str:
+        try:
+            from backend.holdings import HoldingsAnalysis, render_holdings_table
+            holdings = HoldingsAnalysis.from_json(holdings_json_str)
+            holdings_section = (
+                "\n---\n\n## 九、前十大重仓股持仓分析\n\n"
+                + render_holdings_table(holdings)
+                + "\n"
+            )
+        except Exception:
+            holdings_section = "\n---\n\n## 九、前十大重仓股持仓分析\n\n持仓数据获取失败\n"
+
+    # Module 3: 定期报告/经理观点章节
+    periodic_section = ""
+    if periodic_report_json:
+        try:
+            from backend.report_fetcher import PeriodicReport
+            pr = PeriodicReport.from_json(periodic_report_json)
+            mock_tag = "（⚠️ 模拟，仅供参考）" if pr.is_mock else ""
+            bench_in_report = (
+                f"\n\n**报告中的业绩基准描述：** {pr.benchmark_desc}"
+                if pr.benchmark_desc else ""
+            )
+            periodic_section = (
+                f"\n---\n\n## 十、基金经理观点（来源：{pr.report_type}{mock_tag}）\n\n"
+                f"**基金经理观点：**\n> {pr.manager_comment or '暂无'}\n\n"
+                f"**投资策略摘要：**\n{pr.strategy_summary or '暂无'}{bench_in_report}\n"
+            )
+        except Exception:
+            periodic_section = "\n---\n\n## 十、基金经理观点\n\n获取失败\n"
 
     return f"""# 📋 {fund_code} 基金分析报告
 {new_fund_banner}{bench_warn}
@@ -498,6 +562,7 @@ def render_report(
 
 {_clean_commentary(risk_commentary)}
 
+{holdings_section}{periodic_section}
 ---
 
 ## 八、⚠️ 风险提示

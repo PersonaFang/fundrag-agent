@@ -54,6 +54,20 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+# ============ Module 4: 认证检查 ============
+try:
+    import sys
+    import os as _os
+    sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from auth import is_authenticated, render_login_page, render_user_sidebar
+    if not is_authenticated():
+        render_login_page()
+        st.stop()
+    with st.sidebar:
+        render_user_sidebar()
+except ImportError:
+    pass   # auth.py 不存在时跳过认证（开发模式）
+
 # ============ 自定义 CSS 样式 ============
 st.markdown("""
 <style>
@@ -446,6 +460,7 @@ def main():
             with col_export:
                 report_content = result.get("final_report", "")
                 if report_content:
+                    # Markdown 下载（原有）
                     st.download_button(
                         label="📥 导出 Markdown",
                         data=report_content.encode("utf-8"),
@@ -453,6 +468,37 @@ def main():
                         mime="text/markdown",
                         use_container_width=True,
                     )
+
+                    # Module 5: PDF 下载（懒生成，避免每次渲染重复生成）
+                    pdf_cache_key = f"pdf_{fund_code_display}_{hash(report_content)}"
+                    if pdf_cache_key not in st.session_state:
+                        st.session_state[pdf_cache_key] = None
+
+                    if st.button("🖨️ 生成 PDF", use_container_width=True, key="gen_pdf_btn"):
+                        with st.spinner("正在生成 PDF，约需 5-15 秒..."):
+                            try:
+                                from backend.pdf_exporter import export_to_pdf
+                                pdf_bytes = export_to_pdf(
+                                    report_md=report_content,
+                                    fund_code=fund_code_display,
+                                    fund_name=result.get("fund_name", fund_code_display),
+                                    report_date=str(time.strftime("%Y-%m-%d")),
+                                )
+                                st.session_state[pdf_cache_key] = pdf_bytes
+                                if not pdf_bytes:
+                                    st.warning("PDF 生成失败：请安装 weasyprint 或 xhtml2pdf")
+                            except Exception as e:
+                                st.error(f"PDF 生成失败：{e}")
+
+                    cached_pdf = st.session_state.get(pdf_cache_key)
+                    if cached_pdf:
+                        st.download_button(
+                            label="📄 下载 PDF",
+                            data=cached_pdf,
+                            file_name=f"fund_{fund_code_display}_report.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                        )
 
             # ---- Tab 分组展示 ----
             tab_final, tab_market, tab_sentiment, tab_risk = st.tabs([

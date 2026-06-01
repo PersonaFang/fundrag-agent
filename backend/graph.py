@@ -103,6 +103,9 @@ class FundRAGState(TypedDict, total=False):
     warnings:      List[str]
     current_step:  str
 
+    # Module 3: 定期报告（PeriodicReport.to_json()）
+    periodic_report_json: str
+
     # 向后兼容旧版前端字段
     fund_name:          str
     fund_type:          str
@@ -183,6 +186,16 @@ def create_fund_rag_graph():
         try:
             from backend.data_fetcher import fetch_fund_snapshot
             snapshot = fetch_fund_snapshot(code=fund_code, report_date=date.today())
+
+            # Module 1: 拉取持仓（独立 try，失败不阻断主流程）
+            try:
+                from backend.holdings import fetch_holdings
+                holdings = fetch_holdings(fund_code)
+                snapshot.holdings_json = holdings.to_json()
+                print(f"   持仓拉取：前{len(holdings.stocks)}大，集中度={holdings.concentration_level}")
+            except Exception as e_h:
+                print(f"⚠️ [fetch_snapshot] 持仓拉取跳过：{e_h}")
+
             return {
                 "snapshot_json": snapshot.model_dump_json(),
                 # 向后兼容：填充旧版字段
@@ -613,6 +626,7 @@ SENTIMENT_SCORE: [0-10 的数字]
                 market_commentary=state.get("market_commentary", "数据获取失败"),
                 sentiment_commentary=state.get("sentiment_commentary", "数据获取失败"),
                 risk_commentary=state.get("risk_commentary", "数据获取失败"),
+                periodic_report_json=state.get("periodic_report_json", ""),  # Module 3
             )
 
             # 自动修复幻觉词
@@ -653,6 +667,27 @@ SENTIMENT_SCORE: [0-10 的数字]
                 "errors":        state.get("errors", []) + [err],
                 "error_messages": state.get("error_messages", []) + [err],
                 "current_step":  "报告生成失败（已降级）❌",
+            }
+
+    # ============================================================
+    # Module 3: 定期报告节点
+    # ============================================================
+    def node_fetch_periodic_report(state: FundRAGState) -> dict:
+        """拉取基金最新定期报告（季报/半年报），失败不阻断主流程"""
+        fund_code = state["fund_code"]
+        print(f"\n📄 [periodic_report] 拉取定期报告：{fund_code}")
+        try:
+            from backend.report_fetcher import fetch_periodic_report
+            report = fetch_periodic_report(fund_code)
+            return {
+                "periodic_report_json": report.to_json(),
+                "current_step": "定期报告拉取完成 ✅",
+            }
+        except Exception as e:
+            print(f"⚠️ [periodic_report] 跳过：{e}")
+            return {
+                "periodic_report_json": "",
+                "current_step": "定期报告拉取跳过",
             }
 
     # ============================================================
@@ -715,9 +750,10 @@ SENTIMENT_SCORE: [0-10 的数字]
     workflow.add_node("market_agent",      node_market_agent)
     workflow.add_node("sentiment_agent",   node_sentiment_agent)
     workflow.add_node("risk_agent",        node_risk_agent)
-    workflow.add_node("cross_check",       node_cross_check)       # V2.1 新增
+    workflow.add_node("cross_check",        node_cross_check)        # V2.1 新增
     workflow.add_node("render_report",     node_render_report)
-    workflow.add_node("output_guard",      node_output_guard)      # ✅ V2.2 新增
+    workflow.add_node("output_guard",      node_output_guard)       # V2.2 新增
+    workflow.add_node("periodic_report",   node_fetch_periodic_report)  # Module 3 新增
 
     workflow.set_entry_point("fetch_snapshot")
     workflow.add_edge("fetch_snapshot", "validate_quality")
@@ -733,7 +769,8 @@ SENTIMENT_SCORE: [0-10 的数字]
     )
 
     workflow.add_edge("data_issue_report", END)
-    workflow.add_edge("scoring_node",      "market_agent")
+    workflow.add_edge("scoring_node",      "periodic_report")   # Module 3: 先拉季报
+    workflow.add_edge("periodic_report",   "market_agent")
     workflow.add_edge("market_agent",      "sentiment_agent")
     workflow.add_edge("sentiment_agent",   "risk_agent")
     workflow.add_edge("risk_agent",        "cross_check")         # V2.1：risk → cross_check → render
