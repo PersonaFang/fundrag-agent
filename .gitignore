@@ -13,7 +13,7 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
-MyFix/*
+MyFix/
 
 # 缓存和生成的报告（体积大，无需上传）
 cache/*
