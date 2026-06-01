@@ -40,11 +40,11 @@ def test_new_fund_rating_cap():
 
 
 def test_six_month_to_one_year_cap():
-    """运行 200 天（180-365）应被限为「谨慎关注」"""
+    """V2.1：运行 200 天（< 365天）应被限为「持续观察」（V2.1 统一 < 365天均为持续观察）"""
     s = make_snapshot(run_days=200)
     q = make_quality("real")
     score = score_fund(s, q)
-    assert score.rating == "谨慎关注", f"200天基金应为谨慎关注，实际：{score.rating}"
+    assert score.rating == "持续观察", f"200天基金应为持续观察（V2.1），实际：{score.rating}"
 
 
 def test_mock_data_blocks_rating():
@@ -68,8 +68,9 @@ def test_normal_fund_gets_valid_rating():
     s = make_snapshot(run_days=1200, mdd=15.0, ret=80.0)
     q = make_quality("real")
     score = score_fund(s, q, sentiment_score=7.0)
-    assert score.rating in ["适合配置", "积极关注", "谨慎关注"]
-    assert score.confidence == "高"
+    assert score.rating in ["适合配置", "谨慎关注", "风险较高"]
+    assert score.confidence == "高"    # confidence 兼容属性
+    assert score.confidence_label == "高"
     assert score.total_score > 0
 
 

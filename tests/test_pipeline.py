@@ -102,9 +102,9 @@ def test_tools():
         ALL_TOOLS,
     )
 
-    # 测试工具数量
-    print(f"  2.0 工具总数：{len(ALL_TOOLS)} 个（预期 6 个）")
-    assert len(ALL_TOOLS) == 6, f"❌ 工具数量错误：{len(ALL_TOOLS)}"
+    # 测试工具数量（V2.0 新增 tool_search_fund_news_balanced，共 7 个）
+    print(f"  2.0 工具总数：{len(ALL_TOOLS)} 个（预期 7 个）")
+    assert len(ALL_TOOLS) == 7, f"❌ 工具数量错误：{len(ALL_TOOLS)}"
     print(f"  ✅ 工具数量正确：{[t.name for t in ALL_TOOLS]}")
 
     # 测试基金信息工具

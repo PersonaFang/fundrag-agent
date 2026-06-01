@@ -273,7 +273,7 @@ def create_fund_rag_graph():
             )
             from backend.scoring import score_fund
             score = score_fund(dummy_snapshot, dummy_quality)
-            return {"score_json": score.model_dump_json(), "current_step": "评分计算完成（降级）"}
+            return {"score_json": score.to_json(), "current_step": "评分计算完成（降级）"}
 
         try:
             from backend.schemas import FundSnapshot, DataQualityReport
@@ -285,7 +285,7 @@ def create_fund_rag_graph():
 
             print(f"   评分：{score.total_score}/10，评级：{score.rating}，置信度：{score.confidence}")
             return {
-                "score_json":   score.model_dump_json(),
+                "score_json":   score.to_json(),
                 "current_step": "评分计算完成 ✅",
             }
         except Exception as e:
@@ -385,15 +385,18 @@ SENTIMENT_SCORE: [0-10 的数字]
             result = sentiment_agent.invoke({"messages": [("human", query)]}, config=config)
             content = result["messages"][-1].content
 
-            # 提取情绪分数
-            score_match = re.search(r"SENTIMENT_SCORE:\s*(\d+(?:\.\d+)?)", content)
+            # 提取情绪分数：同时支持 V2.1「情绪评分：X」和 V2.0「SENTIMENT_SCORE: X」
+            score_match = (
+                re.search(r"情绪评分[：:]\s*(\d+(?:\.\d+)?)", content)
+                or re.search(r"SENTIMENT_SCORE[：:]\s*(\d+(?:\.\d+)?)", content)
+            )
             sentiment_score = float(score_match.group(1)) if score_match else 5.0
             sentiment_score = max(0.0, min(10.0, sentiment_score))
 
-            # 去掉 SENTIMENT_SCORE 行，只保留解释文字
-            commentary = re.sub(r"SENTIMENT_SCORE:.*\n?---\n?", "", content).strip()
+            # 去掉评分行和分隔符，只保留解释文字
+            commentary = re.sub(r"(情绪评分|SENTIMENT_SCORE)[：:].*\n?---?\n?", "", content).strip()
 
-            print(f"✅ [sentiment_agent] 完成，SENTIMENT_SCORE={sentiment_score}")
+            print(f"✅ [sentiment_agent] 完成，情绪评分={sentiment_score}")
 
             # 用实际情绪分重新计算总分（如果有 snapshot 和 quality）
             new_score_json = state.get("score_json", "")
@@ -404,7 +407,7 @@ SENTIMENT_SCORE: [0-10 的数字]
                     snapshot = FundSnapshot.model_validate_json(state["snapshot_json"])
                     quality  = DataQualityReport.model_validate_json(state["data_quality_json"])
                     new_score = score_fund(snapshot, quality, sentiment_score=sentiment_score)
-                    new_score_json = new_score.model_dump_json()
+                    new_score_json = new_score.to_json()
                     print(f"   更新总分：{new_score.total_score}/10，评级：{new_score.rating}")
                 except Exception as e:
                     print(f"⚠️ 情绪分更新总分失败（保留原分）：{e}")
@@ -476,12 +479,90 @@ SENTIMENT_SCORE: [0-10 的数字]
                 "current_step":     "风险评估失败 ❌",
             }
 
+    def node_cross_check(state: FundRAGState) -> dict:
+        """
+        跨 Agent 一致性校验节点（V2.1 新增）
+        检测舆情分析里是否出现了与 snapshot 矛盾的数字
+        🌰 类比：校对员，确保不同来源的说法不打架
+        """
+        print("\n🔍 [cross_check] 跨Agent一致性校验...")
+
+        sentiment = state.get("sentiment_commentary", "")
+        snapshot_json = state.get("snapshot_json", "{}")
+        errors = list(state.get("errors", []))
+        warnings = list(state.get("warnings", []))
+
+        try:
+            import json as _json
+            snap = _json.loads(snapshot_json)
+            run_days = snap.get("run_days", 0) or 0
+
+            # ---- 规则1：次新基金不应出现"近1年涨幅"作为结论 ----
+            if run_days < 365:
+                year_patterns = [
+                    re.compile(r'近一年涨幅[^，。\n]{0,30}%'),
+                    re.compile(r'近1年[收益涨幅]{0,4}[^，。\n]{0,20}%'),
+                    re.compile(r'过去一年[^，。\n]{0,30}%'),
+                ]
+                for pattern in year_patterns:
+                    m = pattern.search(sentiment)
+                    if m:
+                        matched_text = m.group(0)
+                        if "口径存疑" not in sentiment[max(0, m.start()-20):m.end()+50]:
+                            replacement = (
+                                f"[⚠️ 口径存疑：以下数据的时间窗口可能超过基金实际运行期（{run_days}天）]"
+                                f" {matched_text}"
+                            )
+                            sentiment = sentiment.replace(matched_text, replacement)
+                            warnings.append(
+                                f"舆情修正：次新基金（{run_days}天）出现「近1年」口径数据，已标注存疑"
+                            )
+
+            # ---- 规则2：排名数字一致性检查 ----
+            peer_rank = snap.get("peer_rank", {}) or {}
+            rank_pos   = peer_rank.get("rank", None)
+            rank_total = peer_rank.get("total", None)
+
+            if rank_pos and rank_total and rank_pos > rank_total * 0.8:
+                top_rank_patterns = [
+                    re.compile(r'排名第[123456789][0-9]?位'),
+                    re.compile(r'同类第[123456789][0-9]?'),
+                ]
+                for pattern in top_rank_patterns:
+                    if pattern.search(sentiment):
+                        warnings.append(
+                            "舆情警告：系统排名数据显示倒数，但舆情出现靠前排名描述，"
+                            "可能为新闻口径不同，已记录供参考"
+                        )
+
+            # ---- 规则3：禁用词扫描 ----
+            from backend.value_cleaner import scan_banned_words, auto_fix_text
+            banned = scan_banned_words(sentiment)
+            if banned:
+                fixed, fixes = auto_fix_text(sentiment)
+                sentiment = fixed
+                if fixes:
+                    warnings.append(f"舆情自动修复：{'; '.join(fixes[:3])}")
+
+        except Exception as e:
+            warnings.append(f"跨Agent校验异常（不影响报告）：{e}")
+
+        return {
+            **state,
+            "sentiment_commentary": sentiment,
+            "sentiment_analysis":   sentiment,
+            "errors":       errors,
+            "warnings":     warnings,
+            "current_step": "跨Agent校验完成 ✅",
+        }
+
     def node_render_report(state: FundRAGState) -> dict:
         """用模板渲染最终报告，不依赖 LLM 生成结构"""
         print("\n📝 [render_report] 渲染最终报告...")
 
         try:
-            from backend.schemas import FundSnapshot, DataQualityReport, ScoreBreakdown
+            from backend.schemas import FundSnapshot, DataQualityReport
+            from backend.scoring import ScoreResult
             from backend.report_renderer import render_report
             from backend.output_guard import validate_report, auto_fix_report
             from datetime import date
@@ -495,7 +576,7 @@ SENTIMENT_SCORE: [0-10 的数字]
                        if state.get("data_quality_json")
                        else None)
 
-            score = (ScoreBreakdown.model_validate_json(state["score_json"])
+            score = (ScoreResult.from_json(state["score_json"])
                      if state.get("score_json")
                      else None)
 
@@ -579,6 +660,7 @@ SENTIMENT_SCORE: [0-10 的数字]
     workflow.add_node("market_agent",      node_market_agent)
     workflow.add_node("sentiment_agent",   node_sentiment_agent)
     workflow.add_node("risk_agent",        node_risk_agent)
+    workflow.add_node("cross_check",       node_cross_check)    # V2.1 新增
     workflow.add_node("render_report",     node_render_report)
 
     workflow.set_entry_point("fetch_snapshot")
@@ -598,12 +680,13 @@ SENTIMENT_SCORE: [0-10 的数字]
     workflow.add_edge("scoring_node",      "market_agent")
     workflow.add_edge("market_agent",      "sentiment_agent")
     workflow.add_edge("sentiment_agent",   "risk_agent")
-    workflow.add_edge("risk_agent",        "render_report")
+    workflow.add_edge("risk_agent",        "cross_check")       # V2.1：risk → cross_check → render
+    workflow.add_edge("cross_check",       "render_report")
     workflow.add_edge("render_report",     END)
 
-    print("✅ FundRAG V2.0 Multi-Agent 图构建完成")
-    print("   节点数量：8 个")
-    print("   执行顺序：fetch_snapshot → validate_quality → scoring_node → market_agent → sentiment_agent → risk_agent → render_report")
+    print("✅ FundRAG V2.1 Multi-Agent 图构建完成")
+    print("   节点数量：9 个")
+    print("   执行顺序：fetch_snapshot → validate_quality → scoring_node → market_agent → sentiment_agent → risk_agent → cross_check → render_report")
 
     return workflow.compile(checkpointer=memory)
 
@@ -652,7 +735,7 @@ def run_fund_analysis(fund_code: str, user_question: str = "", session_id: str =
     }
 
     print(f"\n{'#'*50}")
-    print(f"🚀 V2.0 开始分析基金：{fund_code}")
+    print(f"🚀 V2.1 开始分析基金：{fund_code}")
     print(f"   用户问题：{user_question}")
     print(f"   run_id：{run_id}")
     print(f"{'#'*50}")
@@ -664,7 +747,7 @@ def run_fund_analysis(fund_code: str, user_question: str = "", session_id: str =
 
     error_count = len(final_state.get("errors", final_state.get("error_messages", [])))
     print(f"\n{'#'*50}")
-    print(f"🏁 V2.0 分析完成！错误数量：{error_count}")
+    print(f"🏁 V2.1 分析完成！错误数量：{error_count}")
     print(f"{'#'*50}\n")
 
     return final_state

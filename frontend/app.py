@@ -126,40 +126,87 @@ def render_agent_status_table(statuses: dict) -> None:
 
 def render_data_quality_badge(result: dict) -> None:
     """
-    V2.0：根据数据质量等级显示彩色 Badge
+    V2.1：根据数据质量等级显示彩色 Badge（修复文案 + 增加矛盾详情）
     """
     quality_json = result.get("data_quality_json", "")
     if not quality_json:
+        st.warning("数据质量信息未生成")
         return
 
     try:
-        from backend.schemas import DataQualityReport
-        quality = DataQualityReport.model_validate_json(quality_json)
-        badge_config = {
-            "real":    ("🟢 数据真实", "success"),
-            "partial": ("🟡 部分模拟", "warning"),
-            "mock":    ("🔴 全部模拟", "error"),
-            "failed":  ("🔴 数据矛盾", "error"),
-        }
-        label, badge_type = badge_config.get(quality.level.value, ("⚪ 未知", "info"))
+        import json
+        q = json.loads(quality_json)
+        level      = q.get("level", "unknown")
+        mock_count = q.get("mock_metric_count", 0)
+        contras    = q.get("contradictions", [])
 
-        if badge_type == "success":
-            st.success(label)
-        elif badge_type == "warning":
-            st.warning(label)
+        if level == "real":
+            st.success("🟢 数据完整｜核心指标均来自真实接口")
+        elif level == "partial":
+            st.warning(
+                f"🟡 部分模拟｜{mock_count} 项指标为模拟数据，"
+                "不输出正式评级（适配结论显示为「信息不足」）"
+            )
+        elif level == "failed":
+            st.error(
+                f"🔴 数据矛盾｜检测到 {len(contras)} 处不一致，已停止评级生成"
+            )
+            for c in contras[:3]:
+                st.caption(f"  ⛔ {c}")
         else:
-            st.error(label)
+            st.error("🔴 全部模拟｜数据不具参考价值")
 
-        if quality.contradictions:
-            st.error("⛔ 检测到数据矛盾，本次分析不输出正式评级")
-            for c in quality.contradictions:
-                st.caption(f"  - {c}")
+    except Exception as e:
+        st.caption(f"Badge 加载失败：{e}")
 
-        if quality.mock_metric_count > 0:
-            st.warning(f"⚠️ 含 {quality.mock_metric_count} 项模拟数据，适配结论为「信息不足」")
 
-    except Exception:
-        pass
+def render_score_section(result: dict) -> None:
+    """
+    V2.1：独立评分区（修复「吞」等截断问题 + total=None 时显示「不计算」）
+    """
+    score_json = result.get("score_json", "")
+    if not score_json:
+        return
+
+    try:
+        import json
+        from backend.value_cleaner import normalize_rating
+
+        score = json.loads(score_json)
+
+        # ✅ 强制校验评级，防止"吞"等非法值
+        raw_rating  = score.get("rating", "无法评级")
+        safe_rating = normalize_rating(raw_rating)
+
+        total   = score.get("total_score", None)
+        conf    = score.get("confidence_label", score.get("confidence", "低"))
+        rlevel  = score.get("risk_level", "未知")
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            # ✅ total=None 时不显示数字，用文字替代
+            if total is None:
+                st.metric("综合得分", "不计算", help="含模拟数据或次新基金时不输出正式综合分")
+            else:
+                st.metric("综合得分", f"{total}/10")
+        with col2:
+            st.metric("置信度", conf)
+        with col3:
+            st.metric("风险等级", rlevel)
+        with col4:
+            # ✅ 用 st.metric 显示评级，彻底避免 Markdown Emoji 截断
+            st.metric("📌 适配结论", safe_rating)
+
+        cap_reason = score.get("rating_cap_reason", "")
+        if cap_reason:
+            st.warning(f"⚠️ 评级限制：{cap_reason}")
+
+        suitability = score.get("suitability", "")
+        if suitability:
+            st.info(f"👥 适合人群：{suitability}")
+
+    except Exception as e:
+        st.caption(f"评分展示异常：{e}")
 
 
 def render_raw_metrics_expander(result: dict) -> None:
@@ -253,7 +300,7 @@ def main():
         # ---- 分析问题输入 ----
         user_query = st.text_area(
             "你想了解什么？",
-            value="请对这只基金进行全面分析，给出投资建议。",
+            value="请对这只基金进行信息整理、风险分析和适配性观察。",
             height=90,
             help="可以具体描述你的关注点，例如：适合保守型投资者吗？近期有没有风险？",
         )
@@ -396,47 +443,49 @@ def main():
             ])
 
             with tab_final:
-                # V2.0：数据质量 Badge
+                # V2.1：数据质量 Badge
                 render_data_quality_badge(result)
+                st.divider()
 
-                # 次新基金额外提示（兼容旧版字段）
-                if result.get("is_new_fund"):
-                    st.warning(
-                        f"⚠️ **次新基金提示**：该基金运行仅 {result.get('actual_days', 0)} 天，"
-                        "报告中所有历史业绩指标参考价值有限，请谨慎参考。"
-                    )
+                # V2.1：独立评分区（修复截断问题）
+                render_score_section(result)
+                st.divider()
+
+                # V2.1：原始指标溯源
+                render_raw_metrics_expander(result)
+                st.divider()
+
                 final_report = result.get("final_report", "报告生成中...")
                 st.markdown(final_report)
 
-                # V2.0：原始指标溯源
-                render_raw_metrics_expander(result)
-
                 # 显示错误详情（如有）
-                errors = result.get("error_messages", result.get("errors", []))
+                errors = result.get("errors", result.get("error_messages", []))
                 if errors:
-                    with st.expander(f"⚠️ {len(errors)} 个子任务遇到问题（点击查看详情）"):
+                    with st.expander(f"⚠️ {len(errors)} 项数据问题（已降级处理）"):
                         for err in errors:
                             st.warning(err)
 
             with tab_market:
-                st.markdown("### 📊 行情分析师完整报告")
-                market_report = result.get("market_analysis", "数据获取失败")
+                st.markdown("### 📊 行情分析")
+                # V2.1 字段：market_commentary；V2.0 字段：market_analysis
+                market_report = result.get("market_commentary") or result.get("market_analysis", "")
                 if market_report:
                     st.markdown(market_report)
                 else:
                     st.warning("行情分析数据不可用")
 
             with tab_sentiment:
-                st.markdown("### 📰 舆情研究员完整报告")
-                sentiment_report = result.get("sentiment_analysis", "数据获取失败")
+                st.markdown("### 📰 舆情分析")
+                sentiment_report = (result.get("sentiment_commentary")
+                                    or result.get("sentiment_analysis", ""))
                 if sentiment_report:
                     st.markdown(sentiment_report)
                 else:
                     st.warning("舆情分析数据不可用")
 
             with tab_risk:
-                st.markdown("### ⚠️ 风险控制官完整报告")
-                risk_report = result.get("risk_analysis", "数据获取失败")
+                st.markdown("### ⚠️ 风险评估")
+                risk_report = result.get("risk_commentary") or result.get("risk_analysis", "")
                 if risk_report:
                     st.markdown(risk_report)
                 else:

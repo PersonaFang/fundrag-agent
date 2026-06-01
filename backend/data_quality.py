@@ -121,3 +121,156 @@ def validate_snapshot(snapshot: FundSnapshot) -> DataQualityReport:
         can_generate_rating=can_generate_rating,
         can_generate_report=(level != DataQualityLevel.FAILED),
     )
+
+
+# ============================================================
+# V2.1 新增：一致性校验函数
+# ============================================================
+
+def validate_nav_consistency(snapshot) -> list[str]:
+    """
+    校验单位净值与累计净值的一致性
+    🌰 类比：一个人现在的身高不可能低于出生时的身高
+    """
+    warnings = []
+
+    unit_metric = getattr(snapshot, 'unit_nav', None) or getattr(snapshot, 'nav', None)
+    acc_metric  = getattr(snapshot, 'accumulated_nav', None)
+
+    if unit_metric is None or acc_metric is None:
+        return warnings
+
+    unit_val = getattr(unit_metric, 'value', None)
+    acc_val  = getattr(acc_metric,  'value', None)
+
+    if unit_val is None or acc_val is None:
+        return warnings
+
+    try:
+        unit_f = float(unit_val)
+        acc_f  = float(acc_val)
+
+        # 累计净值 < 单位净值：通常说明数据有问题
+        # 注意：有分红的基金累计净值 > 单位净值，没分红时两者相等
+        if acc_f < unit_f and acc_f > 0:
+            # 如果累计净值是 1.0 且单位净值远大于 1，很可能是写死了
+            if abs(acc_f - 1.0) < 0.001 and unit_f > 1.5:
+                warnings.append(
+                    f"累计净值疑似写死为 1.0（单位净值={unit_f:.4f}），"
+                    "请检查 data_fetcher 是否正确获取累计净值走势"
+                )
+                # 标记为 suspicious
+                try:
+                    from backend.schemas import DataNature
+                    acc_metric.nature = DataNature.SUSPICIOUS
+                    acc_metric.confidence = 0.1
+                except Exception:
+                    pass
+            else:
+                warnings.append(
+                    f"累计净值({acc_f:.4f}) < 单位净值({unit_f:.4f})，"
+                    "可能存在数据口径问题"
+                )
+    except (TypeError, ValueError):
+        pass
+
+    return warnings
+
+
+def validate_time_window_consistency(snapshot) -> list[str]:
+    """
+    校验收益率时间窗口与运行天数是否匹配
+    🌰 类比：不能说一个刚出生3个月的孩子的"近1年成绩"
+    """
+    warnings = []
+    run_days = getattr(snapshot, 'run_days', None)
+
+    if run_days is None:
+        return warnings
+
+    checks = [
+        ('return_1y',  365, "近1年收益"),
+        ('return_3y',  730, "近3年收益（至少2年数据）"),
+    ]
+
+    for field_name, min_days, label in checks:
+        metric = getattr(snapshot, field_name, None)
+        if metric is None:
+            continue
+        val = getattr(metric, 'value', None)
+        if val is None:
+            continue
+        if run_days < min_days:
+            warnings.append(
+                f"基金运行仅 {run_days} 天，但存在「{label}」数据，"
+                "该数据可能为系统标签错误（实际为成立以来收益）"
+            )
+            # 标记为可疑
+            try:
+                from backend.schemas import DataNature
+                metric.nature = DataNature.SUSPICIOUS
+                metric.confidence = 0.2
+                metric.note = f"实际运行仅 {run_days} 天，「{label}」标签可能不准确"
+            except Exception:
+                pass
+
+    return warnings
+
+
+def validate_benchmark_consistency(snapshot) -> list[str]:
+    """
+    校验基准指数识别是否与基金名称一致
+    """
+    warnings = []
+    benchmark = getattr(snapshot, 'benchmark', None)
+    if benchmark is None:
+        return warnings
+
+    mismatch = getattr(benchmark, 'mismatch_warning', None)
+    if mismatch:
+        warnings.append(f"基准匹配警告：{mismatch}")
+
+    if not getattr(benchmark, 'is_matched', True):
+        warnings.append(
+            f"基准指数「{getattr(benchmark, 'name', '未知')}」"
+            "未能从基金名称确认，Alpha 计算结果可信度较低"
+        )
+
+    return warnings
+
+
+def validate_mock_count_consistency(snapshot, quality) -> list[str]:
+    """
+    校验 mock_count 的数量是否前后一致
+    （防止报告说"2项模拟"，风险分析说"3个模拟"）
+    """
+    warnings = []
+
+    # 重新计算 mock 数量
+    metric_fields = [
+        'unit_nav', 'nav', 'accumulated_nav', 'fund_size', 'fund_size_bn',
+        'return_since_inception', 'return_1y', 'return_3y',
+        'max_drawdown', 'benchmark_return', 'benchmark_return_pct',
+        'alpha', 'alpha_pct',
+    ]
+    actual_mock = 0
+    for f in metric_fields:
+        m = getattr(snapshot, f, None)
+        if m is None:
+            continue
+        nature_str = ""
+        nature = getattr(m, 'nature', None)
+        if nature:
+            nature_str = nature.value if hasattr(nature, 'value') else str(nature)
+        is_mock_flag = getattr(m, 'is_mock', False)
+        if nature_str == 'mock' or is_mock_flag:
+            actual_mock += 1
+
+    reported_mock = getattr(quality, 'mock_metric_count', -1)
+    if reported_mock >= 0 and abs(reported_mock - actual_mock) > 0:
+        warnings.append(
+            f"mock 数量不一致：quality 报告 {reported_mock} 项，"
+            f"重新计算为 {actual_mock} 项，请检查 validate_snapshot 逻辑"
+        )
+
+    return warnings

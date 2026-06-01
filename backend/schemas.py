@@ -17,6 +17,15 @@ class DataQualityLevel(str, Enum):
     FAILED  = "failed"    # 数据存在硬性矛盾
 
 
+class DataNature(str, Enum):
+    """单个指标的数据性质（V2.1 新增）"""
+    REAL        = "real"        # 来自可信外部接口的真实数据
+    CALCULATED  = "calculated"  # 由 real 数据计算得出
+    MISSING     = "missing"     # 缺失，无法获取
+    MOCK        = "mock"        # 模拟/降级数据
+    SUSPICIOUS  = "suspicious"  # 数据存在疑问
+
+
 class MetricSource(BaseModel):
     """单个指标的完整溯源信息"""
     value:      Optional[Union[float, int, str]] = None
@@ -28,6 +37,8 @@ class MetricSource(BaseModel):
     is_mock:    bool = False
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     note:       Optional[str] = None
+    nature:     Optional[DataNature] = None   # V2.1：数据性质
+    depends_on: list[str] = Field(default_factory=list)  # V2.1：依赖字段名
 
 
 class PeerRank(BaseModel):
