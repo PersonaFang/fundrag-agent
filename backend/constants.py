@@ -65,7 +65,7 @@ MAX_CONFIDENCE_WITH_MOCK = "低"
 # risk_level: 资产本身的风险高低
 # risk_control_score: 基金风控能力（越高越好）
 # ============================================================
-ALLOWED_RISK_LEVELS = frozenset({"低", "中", "中高", "高", "极高"})
+ALLOWED_RISK_LEVELS = frozenset({"低", "中低", "中", "中高", "高", "极高"})
 
 # 最大回撤 → 风险等级 映射
 DRAWDOWN_RISK_MAP = [

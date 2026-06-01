@@ -274,3 +274,182 @@ def validate_mock_count_consistency(snapshot, quality) -> list[str]:
         )
 
     return warnings
+
+
+# ============================================================
+# V2.2 新增：QualityResult 和 assess_quality（含 limited 等级）
+# ============================================================
+
+from dataclasses import dataclass, field as dc_field
+from typing import List
+import json as _json
+
+
+@dataclass
+class QualityResult:
+    """V2.2 新增：更丰富的数据质量结果，含 limited 等级和 summary 文本"""
+    level:               str              # real / limited / partial / failed / unavailable
+    mock_metric_count:   int = 0
+    real_metric_count:   int = 0
+    contradictions:      List[str] = dc_field(default_factory=list)
+    warnings:            List[str] = dc_field(default_factory=list)
+    run_days:            int = None
+    summary:             str = ""
+
+    def to_json(self) -> str:
+        return _json.dumps({
+            "level":               self.level,
+            "mock_metric_count":   self.mock_metric_count,
+            "real_metric_count":   self.real_metric_count,
+            "contradictions":      self.contradictions,
+            "warnings":            self.warnings,
+            "run_days":            self.run_days,
+            "summary":             self.summary,
+        }, ensure_ascii=False)
+
+
+_METRIC_ATTRS = [
+    'unit_nav', 'nav', 'accumulated_nav', 'fund_size', 'fund_size_bn',
+    'return_since_inception', 'return_1y', 'return_3y',
+    'max_drawdown', 'max_drawdown_pct',
+    'benchmark_return', 'benchmark_return_pct',
+    'alpha', 'alpha_pct',
+]
+
+
+def assess_quality(snapshot) -> QualityResult:
+    """
+    V2.2 综合评估数据质量。
+    ✅ 新增 limited 等级：次新基金（run_days<365），数据来源真实但样本不足
+    """
+    run_days       = getattr(snapshot, 'run_days', None)
+    warnings       = []
+    contradictions = []
+    mock_count     = 0
+    real_count     = 0
+
+    # 统计 mock / real 指标数量
+    for attr in _METRIC_ATTRS:
+        m = getattr(snapshot, attr, None)
+        if m is None:
+            continue
+        if getattr(m, 'is_mock', False):
+            mock_count += 1
+        elif getattr(m, 'value', None) is not None:
+            real_count += 1
+
+    # 排名 mock 检查
+    ranking = getattr(snapshot, 'ranking', None) or getattr(snapshot, 'peer_rank', None)
+    if ranking and getattr(ranking, 'is_mock', False):
+        mock_count += 1
+
+    # 一致性检验
+    contradictions.extend(_aq_check_rank_overflow(snapshot))
+    contradictions.extend(_aq_check_nav_consistency(snapshot))
+    contradictions.extend(_aq_check_alpha_validity(snapshot))
+
+    # 次新基金警告
+    if run_days is not None:
+        if run_days < 180:
+            warnings.append(f"基金运行仅 {run_days} 天（< 6个月），所有指标不具统计显著性")
+        elif run_days < 365:
+            warnings.append(f"基金运行仅 {run_days} 天（< 1年），历史业绩参考意义有限")
+
+    # 基准缺失警告
+    benchmark = getattr(snapshot, 'benchmark', None)
+    if benchmark is None or not getattr(benchmark, 'is_matched', False):
+        warnings.append("基准指数未确认，Alpha 不计算")
+
+    # 判断 level
+    if len(contradictions) > 0:
+        level = "failed"
+    elif mock_count > real_count and real_count < 3:
+        level = "unavailable"
+    elif mock_count > 0:
+        level = "partial"
+    elif run_days is not None and run_days < 365:
+        # ✅ 次新基金：数据来源真实但样本不足 → limited
+        level = "limited"
+    else:
+        level = "real"
+
+    summary = _aq_build_summary(level, mock_count, real_count, warnings, contradictions, run_days)
+
+    return QualityResult(
+        level=level,
+        mock_metric_count=mock_count,
+        real_metric_count=real_count,
+        contradictions=contradictions,
+        warnings=warnings,
+        run_days=run_days,
+        summary=summary,
+    )
+
+
+def _aq_build_summary(level, mock_count, real_count, warnings, contradictions, run_days) -> str:
+    lines = []
+    if level == "real":
+        lines.append("✅ 核心指标均来自外部数据接口，未检测到模拟数据")
+    elif level == "limited":
+        lines.append(f"⚠️ 数据来源真实，但运行仅 {run_days} 天，样本量不足，统计意义有限")
+    elif level == "partial":
+        lines.append(f"⚠️ {mock_count} 项指标为模拟数据，适配结论为「信息不足」")
+    elif level == "failed":
+        lines.append(f"🔴 检测到 {len(contradictions)} 处数据矛盾，适配结论为「无法评级」")
+    else:
+        lines.append("🔴 数据严重不足，无法生成有效分析")
+
+    if warnings:
+        lines.append("\n**数据警告：**")
+        for w in warnings:
+            lines.append(f"- {w}")
+    if contradictions:
+        lines.append("\n**数据矛盾：**")
+        for c in contradictions:
+            lines.append(f"- ⛔ {c}")
+    return "\n".join(lines)
+
+
+def _aq_check_rank_overflow(snapshot) -> list:
+    errors = []
+    pr = getattr(snapshot, 'peer_rank', None)
+    if pr is None:
+        return errors
+    rank  = getattr(pr, 'rank', None)
+    total = getattr(pr, 'total', None)
+    if rank and total:
+        try:
+            if int(rank) > int(total):
+                errors.append(f"排名溢出：rank={rank} > total={total}")
+        except (TypeError, ValueError):
+            pass
+    return errors
+
+
+def _aq_check_nav_consistency(snapshot) -> list:
+    errors = []
+    unit_nav = getattr(snapshot, 'unit_nav', None) or getattr(snapshot, 'nav', None)
+    acc_nav  = getattr(snapshot, 'accumulated_nav', None)
+    if unit_nav and acc_nav:
+        uv = getattr(unit_nav, 'value', unit_nav)
+        av = getattr(acc_nav, 'value', acc_nav)
+        try:
+            if float(av) < float(uv) * 0.9:
+                errors.append(f"累计净值({av})异常低于单位净值({uv})")
+        except (TypeError, ValueError):
+            pass
+    return errors
+
+
+def _aq_check_alpha_validity(snapshot) -> list:
+    errors = []
+    benchmark = getattr(snapshot, 'benchmark', None)
+    if benchmark is None:
+        return errors
+    is_matched = getattr(benchmark, 'is_matched', False)
+    alpha = getattr(snapshot, 'alpha', None) or getattr(snapshot, 'alpha_pct', None)
+    if alpha and not is_matched:
+        av = getattr(alpha, 'value', alpha)
+        if av is not None and not getattr(alpha, 'is_mock', False):
+            errors.append(f"Alpha={av} 但基准指数未确认，存在口径矛盾")
+    return errors

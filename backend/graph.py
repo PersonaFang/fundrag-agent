@@ -52,6 +52,33 @@ except Exception:
 
 
 # ============================================================
+# ============================================================
+# V2.2 模块级工具函数（可被测试直接 import）
+# ============================================================
+
+def _extract_sentiment_score(text: str) -> float:
+    """
+    从舆情 Agent 输出中提取情绪评分。
+    ✅ V2.2 修复：只取最后一个匹配，防止重复追加
+    """
+    if not text:
+        return 5.0
+    all_matches = []
+    for pat in [
+        r'情绪评分[：:\s]+(\d+(?:\.\d+)?)',
+        r'情感得分[：:\s]+(\d+(?:\.\d+)?)',
+        r'SENTIMENT_SCORE[：:\s]+(\d+(?:\.\d+)?)',
+    ]:
+        all_matches.extend(re.findall(pat, text, re.IGNORECASE))
+    if not all_matches:
+        return 5.0
+    try:
+        val = float(all_matches[-1])   # ✅ 只取最后一个
+        return round(min(max(val, 0.0), 10.0), 1)
+    except (ValueError, TypeError):
+        return 5.0
+
+
 # V2.0 状态定义
 # ============================================================
 class FundRAGState(TypedDict, total=False):
@@ -385,13 +412,8 @@ SENTIMENT_SCORE: [0-10 的数字]
             result = sentiment_agent.invoke({"messages": [("human", query)]}, config=config)
             content = result["messages"][-1].content
 
-            # 提取情绪分数：同时支持 V2.1「情绪评分：X」和 V2.0「SENTIMENT_SCORE: X」
-            score_match = (
-                re.search(r"情绪评分[：:]\s*(\d+(?:\.\d+)?)", content)
-                or re.search(r"SENTIMENT_SCORE[：:]\s*(\d+(?:\.\d+)?)", content)
-            )
-            sentiment_score = float(score_match.group(1)) if score_match else 5.0
-            sentiment_score = max(0.0, min(10.0, sentiment_score))
+            # ✅ V2.2：使用模块级函数提取，只取最后一个匹配，防止重复
+            sentiment_score = _extract_sentiment_score(content)
 
             # 去掉评分行和分隔符，只保留解释文字
             commentary = re.sub(r"(情绪评分|SENTIMENT_SCORE)[：:].*\n?---?\n?", "", content).strip()
@@ -634,6 +656,39 @@ SENTIMENT_SCORE: [0-10 的数字]
             }
 
     # ============================================================
+    # output_guard 节点（V2.2 新增：挂在 render_report 之后）
+    # ============================================================
+    def node_output_guard(state: FundRAGState) -> dict:
+        """
+        ✅ V2.2 修复：output_guard 挂在 final_report 写入节点之后
+        对 final_report 执行完整检测，自动修复后仍有问题则追加警告头
+        """
+        from backend.output_guard import validate_report, auto_fix_report
+
+        final_report = state.get("final_report", "")
+        if not final_report:
+            return {}
+
+        # 先尝试自动修复
+        fixed_report, fix_log = auto_fix_report(final_report)
+        if fix_log:
+            print(f"  🔧 [output_guard] 自动修复 {len(fix_log)} 处：{fix_log[:3]}")
+
+        ok, errors = validate_report(fixed_report)
+        if not ok:
+            print(f"  ⚠️ [output_guard] 仍有 {len(errors)} 项质量问题（已降级处理）")
+            warning_header = (
+                "\n> ⚠️ **系统质量检测**：本报告经质量守卫检测发现若干文本问题，"
+                "已尽量自动修复，请以数据为准。\n\n"
+            )
+            return {
+                "final_report": warning_header + fixed_report,
+                "errors": state.get("errors", []) + errors,
+            }
+
+        return {"final_report": fixed_report}
+
+    # ============================================================
     # 路由函数：数据矛盾 → 问题报告；否则 → 正常流程
     # ============================================================
     def route_after_quality(state: FundRAGState) -> str:
@@ -660,8 +715,9 @@ SENTIMENT_SCORE: [0-10 的数字]
     workflow.add_node("market_agent",      node_market_agent)
     workflow.add_node("sentiment_agent",   node_sentiment_agent)
     workflow.add_node("risk_agent",        node_risk_agent)
-    workflow.add_node("cross_check",       node_cross_check)    # V2.1 新增
+    workflow.add_node("cross_check",       node_cross_check)       # V2.1 新增
     workflow.add_node("render_report",     node_render_report)
+    workflow.add_node("output_guard",      node_output_guard)      # ✅ V2.2 新增
 
     workflow.set_entry_point("fetch_snapshot")
     workflow.add_edge("fetch_snapshot", "validate_quality")
@@ -680,9 +736,10 @@ SENTIMENT_SCORE: [0-10 的数字]
     workflow.add_edge("scoring_node",      "market_agent")
     workflow.add_edge("market_agent",      "sentiment_agent")
     workflow.add_edge("sentiment_agent",   "risk_agent")
-    workflow.add_edge("risk_agent",        "cross_check")       # V2.1：risk → cross_check → render
+    workflow.add_edge("risk_agent",        "cross_check")         # V2.1：risk → cross_check → render
     workflow.add_edge("cross_check",       "render_report")
-    workflow.add_edge("render_report",     END)
+    workflow.add_edge("render_report",     "output_guard")         # ✅ V2.2：render → guard → END
+    workflow.add_edge("output_guard",      END)
 
     print("✅ FundRAG V2.1 Multi-Agent 图构建完成")
     print("   节点数量：9 个")

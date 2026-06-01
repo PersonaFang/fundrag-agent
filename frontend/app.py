@@ -126,8 +126,9 @@ def render_agent_status_table(statuses: dict) -> None:
 
 def render_data_quality_badge(result: dict) -> None:
     """
-    V2.1：根据数据质量等级显示彩色 Badge
-    ✅ 文案完全硬编码，不含任何 LLM 生成内容（防止"丰田结论"等幻觉词混入）
+    V2.2：根据数据质量等级显示彩色 Badge
+    ✅ 文案完全硬编码，不含任何 LLM 生成内容
+    ✅ 新增 limited 等级处理（次新基金）
     """
     quality_json = result.get("data_quality_json", "")
     if not quality_json:
@@ -139,11 +140,20 @@ def render_data_quality_badge(result: dict) -> None:
         q          = json.loads(quality_json)
         level      = q.get("level", "unknown")
         mock_count = int(q.get("mock_metric_count", 0))
+        run_days   = q.get("run_days", None)
         contras    = q.get("contradictions", [])
+        warnings   = q.get("warnings", [])
 
         # ✅ 全部硬编码，绝无 LLM 生成内容
         if level == "real":
             st.success("🟢 数据完整｜核心指标均来自真实接口")
+        elif level == "limited":
+            # ✅ V2.2 新增：次新基金专属 Badge，不说"完整"
+            day_str = f"{run_days} 天" if run_days else "不足1年"
+            st.warning(
+                f"🟡 样本受限｜基金运行仅 {day_str}，"
+                "数据来源真实但统计意义有限，适配结论为「持续观察」"
+            )
         elif level == "partial":
             st.warning(
                 f"🟡 部分模拟｜{mock_count} 项指标为模拟数据，"
@@ -158,6 +168,12 @@ def render_data_quality_badge(result: dict) -> None:
                 st.caption(f"  ⛔ {c}")
         else:
             st.error("🔴 数据不可用｜无法生成有效分析")
+
+        # 数据警告折叠展示
+        if warnings:
+            with st.expander(f"⚠️ {len(warnings)} 条数据说明"):
+                for w in warnings:
+                    st.caption(f"• {w}")
 
     except Exception as e:
         st.warning(f"⬜ 数据质量 Badge 加载失败：{e}")
