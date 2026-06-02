@@ -140,9 +140,10 @@ def render_agent_status_table(statuses: dict) -> None:
 
 def render_data_quality_badge(result: dict) -> None:
     """
-    V2.2：根据数据质量等级显示彩色 Badge
-    ✅ 文案完全硬编码，不含任何 LLM 生成内容
-    ✅ 新增 limited 等级处理（次新基金）
+    V2.3：数据质量 Badge。
+    ✅ 所有文案完全硬编码
+    ✅ 「适配结论」文案统一（不出现「修正结论」/「建议结论」）
+    ✅ limited 等级处理（次新基金）
     """
     quality_json = result.get("data_quality_json", "")
     if not quality_json:
@@ -158,32 +159,30 @@ def render_data_quality_badge(result: dict) -> None:
         contras    = q.get("contradictions", [])
         warnings   = q.get("warnings", [])
 
-        # ✅ 全部硬编码，绝无 LLM 生成内容
+        # ✅ 全部硬编码，每个字都经过人工校对
         if level == "real":
-            st.success("🟢 数据完整｜核心指标均来自真实接口")
+            st.success("🟢 数据完整｜核心指标均来自真实接口，**适配结论**可信")
         elif level == "limited":
-            # ✅ V2.2 新增：次新基金专属 Badge，不说"完整"
-            day_str = f"{run_days} 天" if run_days else "不足1年"
+            day_str = f"{run_days} 天" if run_days else "不足 1 年"
             st.warning(
-                f"🟡 样本受限｜基金运行仅 {day_str}，"
-                "数据来源真实但统计意义有限，适配结论为「持续观察」"
+                f"🟡 样本受限｜基金运行仅 {day_str}，"        # ✅ "样本受限"（不是"样本模型"）
+                "数据来源真实但统计意义有限，**适配结论**为「持续观察」"  # ✅ "适配结论"
             )
         elif level == "partial":
             st.warning(
                 f"🟡 部分模拟｜{mock_count} 项指标为模拟数据，"
-                "适配结论为「信息不足」，不输出正式评级"
+                "**适配结论**为「信息不足」，不输出正式评级"    # ✅ "不输出"（不是"未输出"）
             )
         elif level == "failed":
             st.error(
                 f"🔴 数据矛盾｜检测到 {len(contras)} 处不一致，"
-                "适配结论为「无法评级」"
+                "**适配结论**为「无法评级」"
             )
             for c in contras[:3]:
                 st.caption(f"  ⛔ {c}")
         else:
             st.error("🔴 数据不可用｜无法生成有效分析")
 
-        # 数据警告折叠展示
         if warnings:
             with st.expander(f"⚠️ {len(warnings)} 条数据说明"):
                 for w in warnings:
@@ -195,7 +194,10 @@ def render_data_quality_badge(result: dict) -> None:
 
 def render_score_section(result: dict) -> None:
     """
-    V2.1：独立评分区（修复「吞」等截断问题 + total=None 时显示「不计算」）
+    V2.3：独立评分区。
+    ✅ 评级使用 normalize_rating + ALLOWED_RATINGS 双重校验
+    ✅ total=None 时显示「不计算」
+    ✅ 「📌 适配结论」label 完全 hardcode
     """
     score_json = result.get("score_json", "")
     if not score_json:
@@ -204,22 +206,24 @@ def render_score_section(result: dict) -> None:
     try:
         import json
         from backend.value_cleaner import normalize_rating
+        from backend.constants import ALLOWED_RATINGS
 
         score = json.loads(score_json)
 
-        # ✅ 强制校验评级，防止"吞"等非法值
+        # ✅ 双重校验：normalize_rating + ALLOWED_RATINGS 白名单
         raw_rating  = score.get("rating", "无法评级")
-        safe_rating = normalize_rating(raw_rating)
+        norm_rating = normalize_rating(raw_rating)
+        safe_rating = norm_rating if norm_rating in ALLOWED_RATINGS else "无法评级"
 
-        total   = score.get("total_score", None)
-        conf    = score.get("confidence_label", score.get("confidence", "低"))
-        rlevel  = score.get("risk_level", "未知")
+        total  = score.get("total_score", None)
+        conf   = score.get("confidence_label", score.get("confidence", "低"))
+        rlevel = score.get("risk_level", "未知")
 
         col1, col2, col3, col4 = st.columns(4)
         with col1:
-            # ✅ total=None 时不显示数字，用文字替代
             if total is None:
-                st.metric("综合得分", "不计算", help="含模拟数据或次新基金时不输出正式综合分")
+                st.metric("综合得分", "不计算",
+                          help="含模拟数据或次新基金时不输出正式综合分")
             else:
                 st.metric("综合得分", f"{total}/10")
         with col2:
@@ -227,14 +231,11 @@ def render_score_section(result: dict) -> None:
         with col3:
             st.metric("风险等级", rlevel)
         with col4:
-            # ✅ 用 st.metric 显示评级，彻底避免 Markdown Emoji 截断
             st.metric("📌 适配结论", safe_rating)
 
         cap_reason = score.get("rating_cap_reason", "")
         if cap_reason:
             st.warning(f"⚠️ 评级限制：{cap_reason}")
-
-        # ✅ 不再显示 suitability（报告模板第四章节已有，避免重复）
 
     except Exception as e:
         st.caption(f"评分展示异常：{e}")

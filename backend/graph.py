@@ -351,13 +351,16 @@ def create_fund_rag_graph():
 {snapshot_json}
 ```
 
-⚠️ 严格规则：
-1. 只能引用 JSON 中已有的数字，禁止自行计算或编造数字
-2. 禁止使用「近3年」，使用 return_since_inception 时注明「自成立以来」
-3. 若字段 is_mock=true，引用时必须加「（模拟数据）」
+⚠️ 严格规则（违反任何一条将导致报告被系统拦截）：
+1. 基金名称必须完整引用 JSON 中 "name" 字段的完整字符串，禁止截断或缩写
+   - 错误示例：「南方达克100」「易方达消费」
+   - 正确示例：「南方纳斯达克100指数发起式证券投资基金(QDII)」
+2. 只能引用 JSON 中已有的数字，禁止自行计算或编造数字
+3. 若字段 is_mock=true，引用时必须标注「（模拟数据，仅供参考）」
 4. 若 run_days < 365，首句必须加粗说明「⚠️ 次新基金，数据参考价值有限」
-5. managers 字段若有多个，逐一介绍，名字来自 name 字段
-6. 用户问题（如有）：{state.get('user_question', '请进行全面分析')}
+5. 禁止出现任何 JSON 字段名（如 is_mock、fund_code、score_json）
+6. managers 字段若有多个，逐一介绍，名字来自 name 字段，不得改动
+7. 用户问题（如有）：{state.get('user_question', '请进行全面分析')}
 
 输出：400字以内的行情分析解释文字，不含表格（表格由系统模板生成）
 """
@@ -411,13 +414,19 @@ def create_fund_rag_graph():
 - fund_industry: "{fund_type}"
 
 根据搜索结果，输出：
-1. 情绪评分（0-10 的数字，10 最乐观）
+1. 情绪评分（0-10 的整数，10 最乐观）——每次只输出一个评分
 2. 情绪分析文字（多空平衡，必须包含「反面观点」小节）
 
-格式：
-SENTIMENT_SCORE: [0-10 的数字]
+格式（严格遵守）：
+SENTIMENT_SCORE: [0-10 的整数]
 ---
 [分析文字]
+
+⚠️ 额外规则：
+- SENTIMENT_SCORE 只能出现一次，放在最开头
+- 禁止在正文中重复出现「情绪评分」或「SENTIMENT_SCORE」字样
+- 禁止出现任何 JSON 字段名（如 run_days、is_mock、fund_code、score_json）
+- 禁止出现投资建议性词汇（建议买入/卖出/持有）
 """
 
         try:
@@ -478,17 +487,22 @@ SENTIMENT_SCORE: [0-10 的数字]
 {state.get("score_json", "{}")}
 ```
 
-快照数据（仅用于引用）：
+快照数据（仅用于引用数值）：
 ```json
 {state.get("snapshot_json", "{}")}
 ```
 
 ⚠️ 严格规则：
-1. 禁止修改评分数字
-2. 禁止忽略 data_penalty（数据不足惩罚）
-3. 若 run_days < 365，「数据充分性风险」必须列为首要风险
+1. **禁止在输出中写出任何 JSON 字段名**，包括：
+   run_days、history_score、sentiment_score、risk_control_score、
+   alpha_adjustment、confidence_label、total_score、is_mock、
+   fund_code、score_json、snapshot_json
+   - 错误示例：「history_score 为不计算」「run_days 为 1280」
+   - 正确示例：「历史业绩得分无法计算」「基金运行 1280 天」
+2. 禁止修改评分数字（只能引用，不能计算）
+3. 若基金运行不足 1 年，「数据充分性风险」必须列为首要风险
 4. 禁止出现「建议买入/卖出/持有」
-5. 只解释，不重新计算
+5. 禁止出现「信息不足」作为风险名称标题（这是评级结论，不是风险名称）
 
 输出：300字以内的风险解释文字，不含表格
 """
@@ -616,8 +630,18 @@ SENTIMENT_SCORE: [0-10 的数字]
                      else None)
 
             if quality is None or score is None:
-                # 降级到文本汇总模式
                 raise ValueError("缺少 quality 或 score，降级处理")
+
+            # ✅ V2.3: 持仓章节在此处生成，不在 render_report 内部抓取
+            holdings_section = ""
+            holdings_json = getattr(snapshot, 'holdings_json', None)
+            if holdings_json:
+                try:
+                    from backend.holdings import HoldingsAnalysis, render_holdings_table
+                    holdings = HoldingsAnalysis.from_json(holdings_json)
+                    holdings_section = render_holdings_table(holdings)
+                except Exception as e_h:
+                    print(f"⚠️ 持仓渲染失败：{e_h}")
 
             raw_report = render_report(
                 snapshot=snapshot,
@@ -626,7 +650,8 @@ SENTIMENT_SCORE: [0-10 的数字]
                 market_commentary=state.get("market_commentary", "数据获取失败"),
                 sentiment_commentary=state.get("sentiment_commentary", "数据获取失败"),
                 risk_commentary=state.get("risk_commentary", "数据获取失败"),
-                periodic_report_json=state.get("periodic_report_json", ""),  # Module 3
+                periodic_report_json=state.get("periodic_report_json", ""),
+                holdings_section=holdings_section,   # ✅ V2.3: 外部传入
             )
 
             # 自动修复幻觉词
@@ -638,10 +663,15 @@ SENTIMENT_SCORE: [0-10 的数字]
             is_valid, guard_errors = validate_report(fixed_report)
             if not is_valid:
                 print(f"  ⚠️ 质量守卫警告：{guard_errors}")
-                fixed_report += f"\n\n---\n> ⚠️ 系统质量校验警告：{'; '.join(guard_errors)}"
+                # ✅ V2.3: 警告记录到 warnings，不追加到报告正文
+                return {
+                    "final_report": fixed_report,
+                    "warnings":     state.get("warnings", []) + guard_errors + (fix_log or []),
+                    "data_quality": state.get("data_quality_json", ""),
+                    "current_step": "报告生成完成（含质量警告）🎉",
+                }
 
             print(f"✅ [render_report] 完成，字数：{len(fixed_report)}")
-            print(f"\n🎉 全部节点执行完毕！")
 
             return {
                 "final_report":   fixed_report,

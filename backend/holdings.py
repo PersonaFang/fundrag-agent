@@ -195,32 +195,47 @@ def fetch_holdings(fund_code: str) -> HoldingsAnalysis:
 def render_holdings_table(holdings: HoldingsAnalysis) -> str:
     """
     渲染前十大重仓股 Markdown 表格。
+    ✅ 列名：「持仓占比」（不是「持仓现场」）
+    ✅ 股票代码/名称字段不混淆
     ✅ is_mock=True 时在标题行加警告
     """
     mock_tag  = "（⚠️ 模拟数据，仅供演示）" if holdings.is_mock else ""
     as_of_str = str(holdings.as_of) if holdings.as_of else "未知"
 
-    lines = [
+    header_line = (
         f"**数据截止：** {as_of_str}　"
         f"**前十大合计：** {holdings.top10_weight_pct}%　"
         f"**前三大合计：** {holdings.top3_weight_pct}%　"
-        f"**集中度：** {holdings.concentration_level}{mock_tag}",
+        f"**集中度：** {holdings.concentration_level}{mock_tag}"
+    )
+
+    lines = [
+        header_line,
         "",
-        "| 排名 | 股票代码 | 股票名称 | 持仓占比 | 行业 |",
+        "| 排名 | 股票代码 | 股票名称 | 持仓占比 | 行业 |",   # ✅ "持仓占比"（不是"持仓现场"）
         "|:----:|:--------:|:--------:|:-------:|:----:|",
     ]
+
     for s in holdings.stocks:
-        industry_display = s.industry or "—"
+        code_str     = str(s.code) if s.code else "—"
+        name_str     = str(s.name) if s.name else "—"
+        weight_str   = f"{s.weight_pct}%"
+        # ✅ 过滤 "nan"/"None" 字符串
+        industry_str = (
+            str(s.industry)
+            if s.industry and str(s.industry) not in ("nan", "None", "")
+            else "—"
+        )
         lines.append(
-            f"| {s.rank} | {s.code} | {s.name} | {s.weight_pct}% | {industry_display} |"
+            f"| {s.rank} | {code_str} | {name_str} | {weight_str} | {industry_str} |"
         )
 
-    # 行业分布小结（仅真实数据）
+    # 行业分布（非 mock 时才显示）
     if holdings.industry_dist and not holdings.is_mock:
         lines.append("")
         lines.append("**行业分布：**")
         sorted_ind = sorted(holdings.industry_dist.items(), key=lambda x: -x[1])
-        dist_str = "　".join([f"{ind}({pct}%)" for ind, pct in sorted_ind[:5]])
-        lines.append(f"> {dist_str}")
+        dist_parts = [f"{ind}（{pct}%）" for ind, pct in sorted_ind[:5]]
+        lines.append(f"> {'　'.join(dist_parts)}")
 
     return "\n".join(lines)

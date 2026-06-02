@@ -20,12 +20,22 @@ class DataQualityLevel(str, Enum):
 
 
 class DataNature(str, Enum):
-    """单个指标的数据性质（V2.1+）"""
-    REAL        = "real"        # 来自可信外部接口的真实数据
-    CALCULATED  = "calculated"  # 由 real 数据计算得出
-    MISSING     = "missing"     # 缺失，无法获取
-    MOCK        = "mock"        # 模拟/降级数据
-    SUSPICIOUS  = "suspicious"  # 数据存在疑问
+    """
+    数据性质枚举（V2.4）。
+    ✅ _missing_：任何非法值（"出口"/"阿富汗"等）自动降级为 MISSING，不抛 ValueError
+    """
+    REAL        = "real"
+    CALCULATED  = "calculated"
+    MISSING     = "missing"
+    MOCK        = "mock"
+    SUSPICIOUS  = "suspicious"
+
+    @classmethod
+    def _missing_(cls, value):
+        """✅ 核心防御：任何非法枚举值自动映射为 MISSING"""
+        import sys
+        print(f"⚠️ [DataNature] 未知值 '{value}' 已自动映射为 'missing'", file=sys.stderr)
+        return cls.MISSING
 
     @classmethod
     def from_any(cls, val) -> "DataNature":
