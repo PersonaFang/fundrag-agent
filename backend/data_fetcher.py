@@ -497,6 +497,241 @@ def _mock_fund_ranking(fund_code: str) -> Dict:
 
 
 # ============================================================
+# V2.5 新增：多接口交叉补全策略
+# 目标：用 akshare 其余接口填充 return_1y / return_3y /
+#        benchmark_return_pct / volatility / sharpe
+# ============================================================
+
+def fetch_returns_from_rank(fund_code: str) -> dict:
+    """
+    从东方财富基金排行接口获取分期收益率。
+    接口：fund_open_fund_rank_em(symbol="全部")
+    包含：近1年、近3年、近5年、成立以来等多个时间窗口。
+    """
+    result = {
+        "return_1y": None,
+        "return_3y": None,
+        "return_5y": None,
+        "as_of":     None,
+    }
+    if not AKSHARE_AVAILABLE:
+        return result
+    try:
+        from datetime import date as date_type
+        df = ak.fund_open_fund_rank_em(symbol="全部")
+        if df is None or df.empty:
+            return result
+
+        code_col = next((c for c in df.columns if "代码" in c), None)
+        if not code_col:
+            return result
+
+        row = df[df[code_col].astype(str) == fund_code]
+        if row.empty:
+            return result
+
+        row = row.iloc[0]
+        result["as_of"] = date_type.today()
+
+        col_map = {
+            "近1年": "return_1y",
+            "1年":   "return_1y",
+            "近3年": "return_3y",
+            "3年":   "return_3y",
+            "近5年": "return_5y",
+            "5年":   "return_5y",
+        }
+        for col_keyword, field in col_map.items():
+            matched_col = next((c for c in df.columns if col_keyword in c), None)
+            if matched_col and pd.notna(row.get(matched_col)):
+                try:
+                    val = float(str(row[matched_col]).replace('%', '').strip())
+                    result[field] = round(val, 2)
+                except (ValueError, TypeError):
+                    pass
+
+        return result
+    except Exception as e:
+        print(f"⚠️ [fetch_returns_from_rank] {fund_code}: {e}")
+        return result
+
+
+def fetch_benchmark_return_from_info(fund_code: str) -> Optional[float]:
+    """
+    从「累计收益率走势」接口提取同期基准收益率（最新值）。
+    """
+    if not AKSHARE_AVAILABLE:
+        return None
+    try:
+        df = ak.fund_open_fund_info_em(
+            symbol=fund_code,
+            indicator="累计收益率走势"
+        )
+        if df is None or df.empty:
+            return None
+
+        bench_col = next(
+            (c for c in df.columns if "基准" in c or "benchmark" in c.lower()),
+            None
+        )
+        if bench_col is None and len(df.columns) >= 2:
+            bench_col = df.columns[1]
+
+        if bench_col:
+            latest_bench = df[bench_col].dropna()
+            if not latest_bench.empty:
+                return round(float(latest_bench.iloc[-1]), 2)
+        return None
+    except Exception as e:
+        print(f"⚠️ [fetch_benchmark_return_from_info] {fund_code}: {e}")
+        return None
+
+
+def compute_volatility_and_sharpe(
+    fund_code: str,
+    risk_free_rate: float = 0.015,
+) -> dict:
+    """
+    从历史净值走势自行计算年化波动率和 Sharpe Ratio。
+    risk_free_rate: 1年期存款利率（默认 1.5%）
+    """
+    result = {
+        "volatility_annual": None,
+        "sharpe_ratio":      None,
+    }
+    if not AKSHARE_AVAILABLE:
+        return result
+    try:
+        import numpy as np
+
+        df = ak.fund_open_fund_info_em(
+            symbol=fund_code,
+            indicator="单位净值走势"
+        )
+        if df is None or df.empty or len(df) < 20:
+            return result
+
+        date_col = df.columns[0]
+        nav_col  = df.columns[1]
+        df = df.sort_values(date_col)
+
+        nav_series = pd.to_numeric(df[nav_col], errors='coerce').dropna()
+        if len(nav_series) < 20:
+            return result
+
+        daily_returns = nav_series.pct_change().dropna()
+        vol_annual    = float(daily_returns.std() * np.sqrt(250) * 100)
+
+        total_return = float(nav_series.iloc[-1] / nav_series.iloc[0] - 1)
+        n_years      = max(len(daily_returns) / 250, 0.1)
+        annual_return = (1 + total_return) ** (1 / n_years) - 1
+
+        excess_return = annual_return - risk_free_rate
+        sharpe = round(excess_return / (vol_annual / 100), 2) if vol_annual > 0 else None
+
+        result["volatility_annual"] = round(vol_annual, 2)
+        result["sharpe_ratio"]      = sharpe
+        return result
+    except Exception as e:
+        print(f"⚠️ [compute_volatility_and_sharpe] {fund_code}: {e}")
+        return result
+
+
+def enrich_snapshot_with_multi_source(snapshot, fund_code: str) -> None:
+    """
+    对已有 snapshot 做多接口补全。
+    只填充 value=None 的字段，不覆盖已有真实数据。
+    在 fetch_fund_snapshot() 末尾调用。
+    """
+    from backend.schemas import MetricSource, DataNature
+    from datetime import date as date_type
+
+    print(f"   [enrich] 开始多接口补全：{fund_code}")
+
+    # ---- 补全分期收益率 ----
+    needs_returns = (
+        getattr(getattr(snapshot, 'return_1y', None), 'value', None) is None
+        or getattr(getattr(snapshot, 'return_3y', None), 'value', None) is None
+    )
+    if needs_returns:
+        returns_data = fetch_returns_from_rank(fund_code)
+        time.sleep(0.3)
+
+        if returns_data.get("return_1y") is not None and \
+                getattr(getattr(snapshot, 'return_1y', None), 'value', None) is None:
+            snapshot.return_1y = MetricSource(
+                value=returns_data["return_1y"],
+                unit="%",
+                as_of=returns_data["as_of"],
+                nature=DataNature.REAL,
+                source="akshare",
+                is_mock=False,
+                endpoint="fund_open_fund_rank_em",
+            )
+            print(f"   [enrich] return_1y 补全：{returns_data['return_1y']}%")
+
+        if returns_data.get("return_3y") is not None and \
+                getattr(getattr(snapshot, 'return_3y', None), 'value', None) is None:
+            snapshot.return_3y = MetricSource(
+                value=returns_data["return_3y"],
+                unit="%",
+                as_of=returns_data["as_of"],
+                nature=DataNature.REAL,
+                source="akshare",
+                is_mock=False,
+                endpoint="fund_open_fund_rank_em",
+            )
+            print(f"   [enrich] return_3y 补全：{returns_data['return_3y']}%")
+
+    # ---- 补全基准收益 ----
+    if getattr(getattr(snapshot, 'benchmark_return_pct', None), 'value', None) is None:
+        bench_val = fetch_benchmark_return_from_info(fund_code)
+        time.sleep(0.3)
+        if bench_val is not None:
+            snapshot.benchmark_return_pct = MetricSource(
+                value=bench_val,
+                unit="%",
+                as_of=date_type.today(),
+                nature=DataNature.REAL,
+                source="akshare",
+                is_mock=False,
+                endpoint="fund_open_fund_info_em(累计收益率走势)",
+            )
+            print(f"   [enrich] benchmark_return_pct 补全：{bench_val}%")
+
+    # ---- 补全波动率和 Sharpe ----
+    needs_vol = getattr(getattr(snapshot, 'volatility', None), 'value', None) is None
+    if needs_vol:
+        vol_data = compute_volatility_and_sharpe(fund_code)
+        time.sleep(0.3)
+        if vol_data.get("volatility_annual") is not None:
+            snapshot.volatility = MetricSource(
+                value=vol_data["volatility_annual"],
+                unit="%",
+                as_of=date_type.today(),
+                nature=DataNature.CALCULATED,
+                source="calculated",
+                is_mock=False,
+                note="由历史日净值走势计算，250个交易日年化",
+            )
+        if vol_data.get("sharpe_ratio") is not None:
+            snapshot.sharpe = MetricSource(
+                value=vol_data["sharpe_ratio"],
+                unit="",
+                as_of=date_type.today(),
+                nature=DataNature.CALCULATED,
+                source="calculated",
+                is_mock=False,
+                note="(年化收益率 - 1.5%无风险利率) / 年化波动率",
+            )
+        if vol_data.get("volatility_annual"):
+            print(f"   [enrich] volatility={vol_data['volatility_annual']}%, "
+                  f"sharpe={vol_data.get('sharpe_ratio')}")
+
+    print(f"   [enrich] 补全完成")
+
+
+# ============================================================
 # V2.0 新增：构建 FundSnapshot 的统一入口
 # ============================================================
 
@@ -656,6 +891,7 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
                 acc_df = acc_df.sort_values(date_col)
                 latest_acc      = float(acc_df[acc_col].iloc[-1])
                 latest_acc_date = acc_df[date_col].iloc[-1].date()
+                from backend.schemas import DataNature
                 accumulated_nav_metric = MetricSource(
                     value=latest_acc,
                     unit="元",
@@ -664,6 +900,7 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
                     as_of=latest_acc_date,
                     is_mock=False,
                     confidence=1.0,
+                    nature=DataNature.REAL,
                 )
                 print(f"✅ 累计净值获取成功：{code} = {latest_acc}")
         except Exception as e:
@@ -687,11 +924,13 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
                     and benchmark_return_metric.value is not None
                     and total_return is not None):
                 alpha_val = round(float(total_return) - float(benchmark_return_metric.value), 2)
+                from backend.schemas import DataNature as _DN
                 alpha_metric = MetricSource(
                     value=alpha_val,
                     unit="%",
                     source="calculated",
                     is_mock=benchmark_return_metric.is_mock,
+                    nature=_DN.CALCULATED,
                     note=f"超额收益 = 基金收益({total_return}%) - 基准收益({benchmark_return_metric.value}%)",
                 )
         except Exception as e:
@@ -717,6 +956,10 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
         benchmark_info = None
 
     # 8. 构建 FundSnapshot
+    from backend.schemas import DataNature
+    _nat_perf  = DataNature.MOCK if is_mock_perf  else DataNature.REAL
+    _nat_basic = DataNature.MOCK if is_mock_basic else DataNature.REAL
+
     snapshot = FundSnapshot(
         code=code,
         report_date=report_date,
@@ -727,7 +970,8 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
         nav=MetricSource(
             value=nav_val, unit="元", source="akshare" if not is_mock_perf else "mock",
             as_of=last_nav_date, is_mock=is_mock_perf,
-            endpoint="fund_open_fund_info_em"
+            endpoint="fund_open_fund_info_em",
+            nature=_nat_perf,
         ) if nav_val is not None else None,
         # ✅ V2.1修复：使用真实接口的累计净值（非first_nav，非写死1.0）
         accumulated_nav=accumulated_nav_metric,
@@ -735,17 +979,20 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
             value=fund_size_val, unit="亿元",
             source="akshare" if not is_mock_basic else "mock",
             is_mock=is_mock_basic,
+            nature=_nat_basic,
         ) if fund_size_val is not None else None,
         return_since_inception=MetricSource(
             value=total_return, unit="%",
             source="akshare" if not is_mock_perf else "mock",
             as_of=last_nav_date, is_mock=is_mock_perf,
             note=perf.get("actual_period_label", ""),
+            nature=_nat_perf,
         ) if total_return is not None else None,
         max_drawdown=MetricSource(
             value=abs(max_drawdown) if max_drawdown is not None else None, unit="%",
             source="akshare" if not is_mock_perf else "mock",
             as_of=last_nav_date, is_mock=is_mock_perf,
+            nature=DataNature.CALCULATED,   # 由净值历史计算
         ) if max_drawdown is not None else None,
         peer_rank=peer_rank,
         managers=managers,
@@ -759,5 +1006,8 @@ def fetch_fund_snapshot(code: str, report_date=None) -> "FundSnapshot":
             "ranking": ranking,
         }
     )
+
+    # 9. V2.5 多接口补全：填充 return_1y / return_3y / benchmark_return_pct / volatility / sharpe
+    enrich_snapshot_with_multi_source(snapshot, code)
 
     return snapshot

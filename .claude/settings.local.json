@@ -11,7 +11,8 @@
       "Bash(/home/fang/projects/fundrag-agent/venv/bin/python -c \"import akshare; print\\(akshare.__version__\\)\")",
       "Bash(/home/fang/projects/fundrag-agent/venv/bin/python *)",
       "Bash(/home/fang/projects/fundrag-agent/venv/bin/pip install *)",
-      "Bash(venv/bin/python *)"
+      "Bash(venv/bin/python *)",
+      "Bash(grep -n \"阿富汗\" /home/fang/projects/fundrag-agent/backend/*.py /home/fang/projects/fundrag-agent/frontend/*.py)"
     ]
   }
 }

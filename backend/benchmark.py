@@ -8,7 +8,7 @@ import akshare as ak
 import pandas as pd
 from datetime import date
 from typing import Optional
-from backend.schemas import MetricSource
+from backend.schemas import MetricSource, DataNature
 
 # 基金类型 → 基准指数映射
 BENCHMARK_MAP = {
@@ -80,6 +80,7 @@ def get_benchmark_return(
             endpoint="stock_zh_index_daily",
             as_of=report_date,
             is_mock=False,
+            nature=DataNature.REAL,
             note=f"基准：{bench_name}（{bench_code}），区间：{inception_date}~{report_date}"
         ), bench_name
 
@@ -97,5 +98,6 @@ def _mock_benchmark(bench_name: str, fund_type: str) -> MetricSource:
     val = mock_returns.get(bench_name, 20.0)
     return MetricSource(
         value=val, unit="%", source="mock",
-        is_mock=True, note="模拟基准收益，仅供演示"
+        is_mock=True, nature=DataNature.MOCK,
+        note="模拟基准收益，仅供演示"
     )

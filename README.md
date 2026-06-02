@@ -1,4 +1,4 @@
-# 📈 FundRAG Multi-Agent V2.4 — 基金智能投研助手
+# 📈 FundRAG Multi-Agent V2.5 — 基金智能投研助手
 
 > 基于 LangGraph + Multi-Agent 架构的 A 股公募基金智能分析系统
 
@@ -20,7 +20,7 @@
 
 ---
 
-## 🏗️ V2.4 系统架构
+## 🏗️ V2.5 系统架构
 
 ### 11 节点流水线
 
@@ -85,7 +85,7 @@
 
 | 模块 | 文件 | 职责 |
 |------|------|------|
-| 数据拉取 | `data_fetcher.py` | akshare 实时数据 + 缓存 + 降级 mock |
+| 数据拉取 | `data_fetcher.py` | akshare 实时数据 + 缓存 + 降级 mock + V2.5 多接口补全 |
 | 数据契约 | `schemas.py` | FundSnapshot / DataQualityReport / ScoreResult |
 | 数据质量 | `data_quality.py` | 矛盾检测 / limited 等级 / run_days 计算 |
 | 评分引擎 | `scoring.py` | 确定性评分 4 路径决策树 + compute_risk_level |
@@ -130,6 +130,22 @@ output_guard 按顺序执行：
 7. 未替换占位符检测
 
 **自动修复 4 步流水线**：本地优先规则 → AUTO_FIX_MAP（按长度降序）→ 正则修复 → 字段名清除
+
+### P4：V2.5 多接口交叉补全
+
+`data_fetcher.py` 中新增 `enrich_snapshot_with_multi_source()`，在主快照构建完成后自动补全缺失字段：
+
+| 字段 | 补全接口 | 说明 |
+|------|---------|------|
+| `return_1y` / `return_3y` | `fund_open_fund_rank_em(全部)` | 东方财富基金排行，含近1/3/5年收益 |
+| `benchmark_return_pct` | `fund_open_fund_info_em(累计收益率走势)` | 取第二列最新值作为同期基准收益 |
+| `volatility` | `fund_open_fund_info_em(单位净值走势)` | 日收益率 std × √250，年化波动率 |
+| `sharpe` | 同上（计算得出） | (年化收益 - 1.5%) / 年化波动率 |
+
+- 只填充 `value=None` 的字段，**不覆盖已有真实数据**
+- `nature` 字段标注为 `REAL`（排行/基准）或 `CALCULATED`（波动率/Sharpe）
+- 接口间自动 sleep 0.3 s，避免 akshare 频率限制
+- 任意接口失败均静默降级，不影响主流程
 
 ### P3：五大扩展模块
 
@@ -213,7 +229,7 @@ fundrag-agent/
 │   ├── schemas.py               # 数据契约（FundSnapshot / DataNature 枚举）
 │   ├── constants.py             # 全局合法值白名单
 │   ├── value_cleaner.py         # 值清洗（normalize_rating / auto_fix_text）
-│   ├── data_fetcher.py          # akshare 数据拉取 + 缓存 + 降级
+│   ├── data_fetcher.py          # akshare 数据拉取 + 缓存 + 降级 + V2.5 多接口补全
 │   ├── data_quality.py          # 数据质量校验（5 级 / run_days 计算）
 │   ├── scoring.py               # 确定性评分（4 路径 + compute_risk_level）
 │   ├── benchmark_resolver.py    # 基准指数解析（20 关键词规则）
@@ -340,6 +356,7 @@ WIND_PASSWORD=your_password
 | V2.2 | 次新基金 limited 等级 / output_guard 挂入 graph / 情绪分去重 |
 | V2.3 | 五大扩展模块（持仓/数据适配器/定期报告/认证/PDF 导出） |
 | V2.4 | DataNature._missing_ 防御 / report_renderer 四重防御 / 三轮样本全面修复 |
+| V2.5 | akshare 多接口交叉补全：return_1y/return_3y/benchmark_return_pct/volatility/sharpe 缺失自动填充 |
 
 ---
 
@@ -349,4 +366,4 @@ WIND_PASSWORD=your_password
 
 ---
 
-*FundRAG Multi-Agent System V2.4 | 数据来源：akshare / Tavily / 基金官方公告*
+*FundRAG Multi-Agent System V2.5 | 数据来源：akshare / Tavily / 基金官方公告*
